@@ -147,101 +147,138 @@ def final_mappping(path_str):
     return path_str
 
 
-async def get_last_number(connection):
+async def get_all_panes_info(connection):
+    """Get information from all panes in the current tab."""
     app = await iterm2.async_get_app(connection)
     window = app.current_terminal_window
-    if window:
-        tab = window.current_tab
-        if tab:
-            session = tab.current_session
-            if session:
-                line_info = await session.async_get_line_info()
-                lines = await session.async_get_contents(
-                    first_line=line_info.first_visible_line_number,
-                    number_of_lines=line_info.mutable_area_height)
 
-                session_type = detect_session_type(lines)
+    if not window:
+        return []
 
-                line = -1
-                current_file = ""
-                arrow_line = -1
-                for line_contents in reversed(lines):
-                    line_str = line_contents.string
-                    if determine_officel_package(line_str):
-                        continue
-                    file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?',
-                                           line_str)
-                    if file_match:
-                        current_file = file_match.group(2)
-                        line = int(file_match.group(4))
-                        break
-                    line_match = re.search(r'-> (\d*)', line_str)
-                    if line_match and arrow_line == -1:
-                        try:
-                            arrow_line = int(line_match.group(1))
-                        except ValueError:
-                            pass
+    tab = window.current_tab
+    if not tab:
+        return []
 
-                if line == -1:
-                    line = arrow_line
+    # Get all sessions (panes) in the current tab
+    sessions = tab.sessions
+    pane_count = len(sessions)
 
-                username = await session.async_get_variable("username")
-                hostname = await session.async_get_variable("hostname")
-                job_name = await session.async_get_variable("jobName")
-                job_args = await session.async_get_variable("commandLine")
+    results = []
+    active_pane_result = None
+    active_session = tab.current_session
 
-                current_dir = ""
-                for line_contents in reversed(lines):
-                    line_str = line_contents.string
-                    folder_match = re.search(
-                        r"(?:^\([^\(]*\))?[^\s:]*:(\/.*?)\s*\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}",
-                        line_str)
-                    if folder_match:
-                        current_dir = folder_match.group(1)
-                        break
-                if current_dir == "":
-                    # parse current_dir from current_file if current_dir is not found
-                    if current_file:
-                        current_dir = os.path.dirname(current_file)
-                    else:
-                        current_dir = await session.async_get_variable("path")
+    # For each pane, get its information
+    for pane_ind, session in enumerate(sessions):
+        # Get info for this specific session
+        pane_info = await get_pane_info(connection, session)
+        pane_info["pane_index"] = pane_ind
 
-                if job_name == "ssh":
-                    configs = parse_ssh_config()
-                    if hostname in [
-                            "yuhes-mbp", "Yuhes-MacBook-Pro.local", "Yuhes-MBP.lan"
-                    ]:
-                        real_host = job_args.split("@")[-1]
-                        hostname = real_host.split(":")[0]
-                    machine_str = job_args.split(' ')[-1]
-                    if configs.lookup(machine_str).get('hostname') != machine_str:
-                        hostname = machine_str
+        # Check if this is the active pane
+        if session == active_session:
+            active_pane_result = pane_info
+        else:
+            results.append(pane_info)
 
-                    if job_args.startswith("ssh -W"):
-                        # ssh -W %h:%p host
-                        # extract hostname, combine job_name and ssh config file content
-                        hostname = get_hostname_from_config_when_jump(job_args, configs)
-                if (not username or username == "") and job_name == "ssh":
-                    try:
-                        username = job_args.split(" ")[1].split("@")[0]
-                    except (IndexError, AttributeError):
-                        username = ""  # or set a default username
-                if (not hostname or hostname == "") and job_name == "ssh":
-                    try:
-                        hostname = job_args.split("@")[-1].split(":")[0]
-                    except (IndexError, AttributeError):
-                        hostname = ""
+    # Ensure active pane is first in the results
+    if active_pane_result:
+        results.insert(0, active_pane_result)
 
-    return {
-        "username": username,
-        "hostname": hostname,
-        "job_name": job_name,
-        "job_args": job_args,
-        "current_dir": current_dir,
-        "line": line,
-        "current_file": final_mappping(current_file),
-        "session_type": session_type,  # Add this
-    }
+    return results
+
+
+async def get_pane_info(connection, target_session):
+    """Modified version of get_last_number that works with a specific session."""
+    app = await iterm2.async_get_app(connection)
+    window = app.current_terminal_window
+
+    if window and target_session:
+        line_info = await target_session.async_get_line_info()
+        lines = await target_session.async_get_contents(
+            first_line=line_info.first_visible_line_number,
+            number_of_lines=line_info.mutable_area_height)
+
+        session_type = detect_session_type(lines)
+
+        line = -1
+        current_file = ""
+        arrow_line = -1
+        for line_contents in reversed(lines):
+            line_str = line_contents.string
+            if determine_officel_package(line_str):
+                continue
+            file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?',
+                                   line_str)
+            if file_match:
+                current_file = file_match.group(2)
+                line = int(file_match.group(4))
+                break
+            line_match = re.search(r'-> (\d*)', line_str)
+            if line_match and arrow_line == -1:
+                try:
+                    arrow_line = int(line_match.group(1))
+                except ValueError:
+                    pass
+
+        if line == -1:
+            line = arrow_line
+
+        username = await target_session.async_get_variable("username")
+        hostname = await target_session.async_get_variable("hostname")
+        job_name = await target_session.async_get_variable("jobName")
+        job_args = await target_session.async_get_variable("commandLine")
+
+        current_dir = ""
+        for line_contents in reversed(lines):
+            line_str = line_contents.string
+            folder_match = re.search(
+                r"(?:^\([^\(]*\))?[^\s:]*:(\/.*?)\s*\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}",
+                line_str)
+            if folder_match:
+                current_dir = folder_match.group(1)
+                break
+        if current_dir == "":
+            # parse current_dir from current_file if current_dir is not found
+            if current_file:
+                current_dir = os.path.dirname(current_file)
+            else:
+                current_dir = await target_session.async_get_variable("path")
+
+        if job_name == "ssh":
+            configs = parse_ssh_config()
+            if hostname in ["yuhes-mbp", "Yuhes-MacBook-Pro.local", "Yuhes-MBP.lan"]:
+                real_host = job_args.split("@")[-1]
+                hostname = real_host.split(":")[0]
+            machine_str = job_args.split(' ')[-1]
+            if configs.lookup(machine_str).get('hostname') != machine_str:
+                hostname = machine_str
+
+            if job_args.startswith("ssh -W"):
+                # ssh -W %h:%p host
+                # extract hostname, combine job_name and ssh config file content
+                hostname = get_hostname_from_config_when_jump(job_args, configs)
+        if (not username or username == "") and job_name == "ssh":
+            try:
+                username = job_args.split(" ")[1].split("@")[0]
+            except (IndexError, AttributeError):
+                username = ""  # or set a default username
+        if (not hostname or hostname == "") and job_name == "ssh":
+            try:
+                hostname = job_args.split("@")[-1].split(":")[0]
+            except (IndexError, AttributeError):
+                hostname = ""
+
+        return {
+            "username": username,
+            "hostname": hostname,
+            "job_name": job_name,
+            "job_args": job_args,
+            "current_dir": current_dir,
+            "line": line,
+            "current_file": final_mappping(current_file),
+            "session_type": session_type,
+        }
+
+    return {}
 
 
 async def send_code_to_iterm(code, connection):
@@ -272,7 +309,7 @@ async def handle_runcode(request, connection):
 
 
 async def handle_breakpoint(request, connection):
-    break_info = await get_last_number(connection)
+    break_info = await get_all_panes_info(connection)
     return aiohttp.web.json_response(break_info)
 
 
