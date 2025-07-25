@@ -135,6 +135,8 @@ def determine_officel_package(line_str):
 
 
 def final_mappping(path_str):
+    if not path_str:
+        return ""
     mappings = {
         "/root/.cache/huggingface/modules/transformers_modules":
             "/root/workspace/crhavk47v38s73fnfgbg/dcformer",
@@ -145,6 +147,25 @@ def final_mappping(path_str):
         if old_path in path_str:
             path_str = path_str.replace(old_path, new_path)
     return path_str
+
+def reconstruct_logical_lines(lines):
+    """Reconstruct logical lines from wrapped physical lines using iTerm2's hard_eol property"""
+    logical_lines = []
+    current_line = ""
+
+    for line in lines:
+        current_line += line.string
+
+        # If this line has a hard end-of-line, it's the end of a logical line
+        if line.hard_eol:
+            logical_lines.append(current_line)
+            current_line = ""
+
+    # Don't forget the last line if it doesn't end with hard_eol
+    if current_line:
+        logical_lines.append(current_line)
+
+    return logical_lines
 
 
 async def get_all_panes_info(connection):
@@ -199,20 +220,21 @@ async def get_pane_info(connection, target_session):
 
         session_type = detect_session_type(lines)
 
+        # Reconstruct logical lines from wrapped physical lines
+        logical_lines = reconstruct_logical_lines(lines)
+
         line = -1
         current_file = ""
         arrow_line = -1
-        for line_contents in reversed(lines):
-            line_str = line_contents.string
-            if determine_officel_package(line_str):
+        for logical_line in reversed(logical_lines):
+            if determine_officel_package(logical_line):
                 continue
-            file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?',
-                                   line_str)
+            file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?', logical_line)
             if file_match:
                 current_file = file_match.group(2)
                 line = int(file_match.group(4))
                 break
-            line_match = re.search(r'-> (\d*)', line_str)
+            line_match = re.search(r'-> (\d*)', logical_line)
             if line_match and arrow_line == -1:
                 try:
                     arrow_line = int(line_match.group(1))
@@ -228,11 +250,10 @@ async def get_pane_info(connection, target_session):
         job_args = await target_session.async_get_variable("commandLine")
 
         current_dir = ""
-        for line_contents in reversed(lines):
-            line_str = line_contents.string
+        for logical_line in reversed(logical_lines):
             folder_match = re.search(
                 r"(?:^\([^\(]*\))?[^\s:]*:(\/.*?)\s*\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}",
-                line_str)
+                logical_line)
             if folder_match:
                 current_dir = folder_match.group(1)
                 break
