@@ -112,7 +112,7 @@ def get_hostname_from_config_when_jump(job_args, configs):
 
 
 def determine_officel_package(line_str):
-    # Convert backslashes to forward slashes for consistency
+    """Determine if a line contains official package information"""
     line_str = line_str.replace('\\', '/')
 
     # Regex pattern to match lib/pythonX.Y/site-packages
@@ -135,18 +135,20 @@ def determine_officel_package(line_str):
 
 
 def final_mappping(path_str):
+    """Apply final path mappings"""
     if not path_str:
         return ""
     mappings = {
         "/root/.cache/huggingface/modules/transformers_modules":
             "/root/workspace/crhavk47v38s73fnfgbg/dcformer",
-        "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify_format":
+        "/home/yuhe/.cache/huggingface/modules/transformers_modules":
             "/home/yuhe/dcformer"
     }
     for old_path, new_path in mappings.items():
         if old_path in path_str:
             path_str = path_str.replace(old_path, new_path)
     return path_str
+
 
 def reconstruct_logical_lines(lines):
     """Reconstruct logical lines from wrapped physical lines using iTerm2's hard_eol property"""
@@ -161,7 +163,6 @@ def reconstruct_logical_lines(lines):
             logical_lines.append(current_line)
             current_line = ""
 
-    # Don't forget the last line if it doesn't end with hard_eol
     if current_line:
         logical_lines.append(current_line)
 
@@ -180,35 +181,24 @@ async def get_all_panes_info(connection):
     if not tab:
         return []
 
-    # Get all sessions (panes) in the current tab
     sessions = tab.sessions
-    pane_count = len(sessions)
-
     results = []
-    active_pane_result = None
     active_session = tab.current_session
 
-    # For each pane, get its information
     for pane_ind, session in enumerate(sessions):
-        # Get info for this specific session
         pane_info = await get_pane_info(connection, session)
         pane_info["pane_index"] = pane_ind
 
-        # Check if this is the active pane
         if session == active_session:
-            active_pane_result = pane_info
+            results.insert(0, pane_info)
         else:
             results.append(pane_info)
-
-    # Ensure active pane is first in the results
-    if active_pane_result:
-        results.insert(0, active_pane_result)
 
     return results
 
 
 async def get_pane_info(connection, target_session):
-    """Modified version of get_last_number that works with a specific session."""
+    """Get information from a specific session/pane."""
     app = await iterm2.async_get_app(connection)
     window = app.current_terminal_window
 
@@ -219,13 +209,12 @@ async def get_pane_info(connection, target_session):
             number_of_lines=line_info.mutable_area_height)
 
         session_type = detect_session_type(lines)
-
-        # Reconstruct logical lines from wrapped physical lines
         logical_lines = reconstruct_logical_lines(lines)
 
         line = -1
         current_file = ""
         arrow_line = -1
+
         for logical_line in reversed(logical_lines):
             if determine_officel_package(logical_line):
                 continue
@@ -257,8 +246,8 @@ async def get_pane_info(connection, target_session):
             if folder_match:
                 current_dir = folder_match.group(1)
                 break
+
         if current_dir == "":
-            # parse current_dir from current_file if current_dir is not found
             if current_file:
                 current_dir = os.path.dirname(current_file)
             else:
@@ -274,14 +263,14 @@ async def get_pane_info(connection, target_session):
                 hostname = machine_str
 
             if job_args.startswith("ssh -W"):
-                # ssh -W %h:%p host
-                # extract hostname, combine job_name and ssh config file content
                 hostname = get_hostname_from_config_when_jump(job_args, configs)
+
         if (not username or username == "") and job_name == "ssh":
             try:
                 username = job_args.split(" ")[1].split("@")[0]
             except (IndexError, AttributeError):
-                username = ""  # or set a default username
+                username = ""
+
         if (not hostname or hostname == "") and job_name == "ssh":
             try:
                 hostname = job_args.split("@")[-1].split(":")[0]
@@ -302,54 +291,238 @@ async def get_pane_info(connection, target_session):
     return {}
 
 
-async def send_code_to_iterm(code, connection):
+async def send_code_to_iterm(code, connection, target_pane=None, broadcast=False, is_ascii=False, multiline=False):
+    """Enhanced function to send code to iTerm2 with broadcast and targeting support"""
     app = await iterm2.async_get_app(connection)
     window = app.current_terminal_window
-    if window:
-        tab = window.current_tab
-        if tab:
-            session = tab.current_session
-            if session:
-                pyperclip.copy(code)
-                await session.async_send_text(code)
-                await session.async_send_text("\n")
-                return True  # Return True when code is sent successfully
-    return False  # Return False if any step fails
+
+    if not window:
+        return False
+
+    tab = window.current_tab
+    if not tab:
+        return False
+
+    try:
+        if broadcast:
+            # Broadcast to all sessions in current tab
+            sessions = tab.sessions
+            for session in sessions:
+                if is_ascii:
+                    # Send ASCII character
+                    ascii_code = ord(code) if len(code) == 1 else int(code)
+                    await session.async_send_text(chr(ascii_code))
+                else:
+                    # Send regular text
+                    if multiline:
+                        # For multiline content, copy to clipboard and paste
+                        pyperclip.copy(code)
+                        # Send Ctrl+U to clear line, then Cmd+V to paste
+                        await session.async_send_text('\x15')  # Ctrl+U
+                        await asyncio.sleep(0.1)
+                        # Use iTerm2's paste functionality
+                        await session.async_send_text(code)
+                        await session.async_send_text('\n')
+                    else:
+                        await session.async_send_text(code)
+                        await session.async_send_text('\n')
+        else:
+            # Send to specific pane or current session
+            if target_pane is not None:
+                # Select specific pane (convert from 1-based to 0-based)
+                pane_index = target_pane - 1
+                sessions = tab.sessions
+                if 0 <= pane_index < len(sessions):
+                    session = sessions[pane_index]
+                else:
+                    session = tab.current_session
+            else:
+                session = tab.current_session
+
+            if is_ascii:
+                ascii_code = ord(code) if len(code) == 1 else int(code)
+                await session.async_send_text(chr(ascii_code))
+            else:
+                if multiline:
+                    pyperclip.copy(code)
+                    await session.async_send_text('\x15')  # Ctrl+U
+                    await asyncio.sleep(0.1)
+                    await session.async_send_text(code)
+                    await session.async_send_text('\n')
+                else:
+                    await session.async_send_text(code)
+                    await session.async_send_text('\n')
+
+        return True
+
+    except Exception as e:
+        print(f"Error sending code to iTerm: {e}")
+        return False
 
 
-async def handle_runcode(request, connection):
-    data = await request.json()
-    code_snippet = data.get('code')
-    if code_snippet:
-        success = await send_code_to_iterm(code_snippet, connection)  # Check return value
+async def select_pane(connection, pane_number):
+    """Select a specific pane in the current tab"""
+    app = await iterm2.async_get_app(connection)
+    window = app.current_terminal_window
+
+    if not window:
+        return False
+
+    tab = window.current_tab
+    if not tab:
+        return False
+
+    try:
+        sessions = tab.sessions
+        # Convert from 1-based to 0-based indexing
+        pane_index = pane_number - 1
+
+        if 0 <= pane_index < len(sessions):
+            await tab.async_select_session(sessions[pane_index])
+            return True
+        else:
+            # If pane number is out of range, select first session
+            if sessions:
+                await tab.async_select_session(sessions[0])
+            return False
+    except Exception as e:
+        print(f"Error selecting pane: {e}")
+        return False
+
+
+async def create_new_pane(connection):
+    """Create a new pane in the current tab"""
+    app = await iterm2.async_get_app(connection)
+    window = app.current_terminal_window
+
+    if not window:
+        return False
+
+    tab = window.current_tab
+    if not tab:
+        return False
+
+    try:
+        # Split current session horizontally to create new pane
+        current_session = tab.current_session
+        if current_session:
+            await current_session.async_split_pane(vertical=True)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error creating new pane: {e}")
+        return False
+
+
+# HTTP Request Handlers
+
+async def handle_send_code(request, connection):
+    """Enhanced handler for sending code with broadcast and targeting support"""
+    try:
+        data = await request.json()
+        code = data.get('code', '')
+        target_pane = data.get('target_pane')
+        broadcast = data.get('broadcast', False)
+        is_ascii = data.get('is_ascii', False)
+        multiline = data.get('multiline', False)
+
+        if not code:
+            return aiohttp.web.Response(text='No code provided', status=400)
+
+        success = await send_code_to_iterm(
+            code, connection, target_pane, broadcast, is_ascii, multiline
+        )
+
         if success:
-            return aiohttp.web.Response(text='Code sent successfully')
+            if broadcast:
+                return aiohttp.web.Response(text=f'Code broadcasted to all panes successfully')
+            elif target_pane:
+                return aiohttp.web.Response(text=f'Code sent to pane {target_pane} successfully')
+            else:
+                return aiohttp.web.Response(text='Code sent to current pane successfully')
         else:
             return aiohttp.web.Response(text='Failed to send code', status=500)
-    return aiohttp.web.Response(text='No code provided', status=400)
+
+    except Exception as e:
+        return aiohttp.web.Response(text=f'Error processing request: {str(e)}', status=400)
+
+
+async def handle_control(request, connection):
+    """Handler for control operations like selecting panes or creating new ones"""
+    try:
+        data = await request.json()
+        action = data.get('action')
+
+        if action == 'select_pane':
+            pane_number = data.get('pane_number')
+            if pane_number is None:
+                return aiohttp.web.Response(text='Pane number required', status=400)
+
+            success = await select_pane(connection, pane_number)
+            if success:
+                return aiohttp.web.Response(text=f'Selected pane {pane_number}')
+            else:
+                return aiohttp.web.Response(text=f'Failed to select pane {pane_number}', status=500)
+
+        elif action == 'new_pane':
+            success = await create_new_pane(connection)
+            if success:
+                return aiohttp.web.Response(text='New pane created successfully')
+            else:
+                return aiohttp.web.Response(text='Failed to create new pane', status=500)
+
+        else:
+            return aiohttp.web.Response(text='Unknown action', status=400)
+
+    except Exception as e:
+        return aiohttp.web.Response(text=f'Error processing control request: {str(e)}', status=400)
 
 
 async def handle_breakpoint(request, connection):
-    break_info = await get_all_panes_info(connection)
-    return aiohttp.web.json_response(break_info)
+    """Handler for breakpoint information requests"""
+    try:
+        break_info = await get_all_panes_info(connection)
+        return aiohttp.web.json_response(break_info)
+    except Exception as e:
+        return aiohttp.web.Response(text=f'Error getting breakpoint info: {str(e)}', status=500)
 
 
 async def main(connection):
+    """Main function to set up and run the web server"""
     app = aiohttp.web.Application()
+
+    # Create handlers with connection binding
     breakpoint_handler = partial(handle_breakpoint, connection=connection)
-    runcode_handler = partial(handle_runcode, connection=connection)
+    send_code_handler = partial(handle_send_code, connection=connection)
+    control_handler = partial(handle_control, connection=connection)
+
+    # Set up routes
     app.router.add_get('/breakpoint', breakpoint_handler)
-    app.router.add_post('/send_code', runcode_handler)
+    app.router.add_post('/send_code', send_code_handler)
+    app.router.add_post('/control', control_handler)
+
+    # Add CORS support for development
+    app.router.add_options('/{path:.*}', lambda request: aiohttp.web.Response(
+        headers={'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type'}))
+
+    # Start the server
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, 'localhost', 17647)
     await site.start()
-    print("Server running on http://localhost:17647")
+    print("Enhanced iTerm2 Web Server running on http://localhost:17647")
+    print("Available endpoints:")
+    print("  GET  /breakpoint - Get all pane information")
+    print("  POST /send_code  - Send code to panes (supports broadcast and targeting)")
+    print("  POST /control    - Control operations (select_pane, new_pane)")
 
-    # Add an infinite loop to keep the server running:
+    # Keep the server running
     while True:
-        await asyncio.sleep(3600)  # Sleep for 1 hour
+        await asyncio.sleep(3600)
 
 
-# Run the server
-iterm2.run_until_complete(main)
+# Run the enhanced server
+if __name__ == "__main__":
+    iterm2.run_until_complete(main)
