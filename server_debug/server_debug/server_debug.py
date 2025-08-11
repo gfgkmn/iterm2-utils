@@ -62,6 +62,46 @@ def parse_ssh_config():
             print(f"Error parsing SSH config: {e}")
     return None
 
+def is_host_in_config(host_string, config):
+    """Check if a host string matches any configured host pattern"""
+    if not config:
+        return False
+
+    # Lookup returns the resolved config if the host matches any pattern
+    host_config = config.lookup(host_string)
+
+    # Check if this resolved to an actual configured host
+    # (paramiko always returns something, so we need to verify)
+    configured_hosts = config.get_hostnames()
+
+    # Try to match against each configured pattern
+    for pattern in configured_hosts:
+        if config.lookup(pattern).get('hostname') == host_config.get('hostname'):
+            # Additional check: see if the pattern actually matches our string
+            import fnmatch
+            if fnmatch.fnmatch(host_string, pattern):
+                return True
+
+    return False
+
+def reverse_lookup_ssh_config(machine_string, config):
+    """Reverse lookup SSH config by hostname to find matching host entries"""
+    if not config:
+        return []
+
+    matching_host = None
+
+    # Get all host patterns from the config
+    for host in config.get_hostnames():
+        # Look up the configuration for this host pattern
+        host_config = config.lookup(host)
+
+        # Check if the hostname matches our target
+        if host_config.get('hostname') == machine_string:
+            matching_host = host
+            break
+
+    return matching_host
 
 def get_hostname_from_config_when_jump(job_args, configs):
     """
@@ -141,8 +181,10 @@ def final_mappping(path_str):
     mappings = {
         "/root/.cache/huggingface/modules/transformers_modules":
             "/root/workspace/crhavk47v38s73fnfgbg/dcformer",
+        "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify_format":
+            "/home/yuhe/dcformer",
         "/home/yuhe/.cache/huggingface/modules/transformers_modules":
-            "/home/yuhe/dcformer"
+            "/home/yuhe/dcformer",
     }
     for old_path, new_path in mappings.items():
         if old_path in path_str:
@@ -255,15 +297,18 @@ async def get_pane_info(connection, target_session):
 
         if job_name == "ssh":
             configs = parse_ssh_config()
-            if hostname in ["yuhes-mbp", "Yuhes-MacBook-Pro.local", "Yuhes-MBP.lan"]:
-                real_host = job_args.split("@")[-1]
-                hostname = real_host.split(":")[0]
-            machine_str = job_args.split(' ')[-1]
-            if configs.lookup(machine_str).get('hostname') != machine_str:
-                hostname = machine_str
-
             if job_args.startswith("ssh -W"):
                 hostname = get_hostname_from_config_when_jump(job_args, configs)
+            else:
+                if job_args.find('@') != -1:
+                    machine_str = job_args.split('@')[-1]
+                else:
+                    machine_str = job_args.split(' ')[-1]
+
+                if is_host_in_config(machine_str, configs):
+                    hostname = machine_str
+                else:
+                    hostname = reverse_lookup_ssh_config(machine_str, configs)
 
         if (not username or username == "") and job_name == "ssh":
             try:
