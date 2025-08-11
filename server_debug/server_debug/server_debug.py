@@ -62,6 +62,7 @@ def parse_ssh_config():
             print(f"Error parsing SSH config: {e}")
     return None
 
+
 def is_host_in_config(host_string, config):
     """Check if a host string matches any configured host pattern"""
     if not config:
@@ -84,6 +85,7 @@ def is_host_in_config(host_string, config):
 
     return False
 
+
 def reverse_lookup_ssh_config(machine_string, config):
     """Reverse lookup SSH config by hostname to find matching host entries"""
     if not config:
@@ -102,6 +104,7 @@ def reverse_lookup_ssh_config(machine_string, config):
             break
 
     return matching_host
+
 
 def get_hostname_from_config_when_jump(job_args, configs):
     """
@@ -260,7 +263,8 @@ async def get_pane_info(connection, target_session):
         for logical_line in reversed(logical_lines):
             if determine_officel_package(logical_line):
                 continue
-            file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?', logical_line)
+            file_match = re.search(r'(File|>)\s*"?([^"=(]+)(", line |\()(\d+)\)?',
+                                   logical_line)
             if file_match:
                 current_file = file_match.group(2)
                 line = int(file_match.group(4))
@@ -336,7 +340,12 @@ async def get_pane_info(connection, target_session):
     return {}
 
 
-async def send_code_to_iterm(code, connection, target_pane=None, broadcast=False, is_ascii=False, multiline=False):
+async def send_code_to_iterm(code,
+                             connection,
+                             target_pane=None,
+                             broadcast=False,
+                             is_ascii=False,
+                             multiline=False):
     """Enhanced function to send code to iTerm2 with broadcast and targeting support"""
     app = await iterm2.async_get_app(connection)
     window = app.current_terminal_window
@@ -348,29 +357,45 @@ async def send_code_to_iterm(code, connection, target_pane=None, broadcast=False
     if not tab:
         return False
 
+    async def send_to_session(session, code, is_ascii, multiline):
+        """Helper function to send code to a single session"""
+        if is_ascii:
+            # Send ASCII character
+            ascii_code = ord(code) if len(code) == 1 else int(code)
+            await session.async_send_text(chr(ascii_code))
+        else:
+            # Get session info to determine type
+            session_info = await get_pane_info(connection, session)
+            session_type = session_info.get('session_type', 'unknown')
+
+            if multiline:
+                # For IPython sessions, use %paste magic command
+                if session_type == 'ipython':
+                    # Copy to clipboard first
+                    pyperclip.copy(code)
+                    # Send %paste command
+                    await session.async_send_text('%paste\n')
+                    # Small delay to let IPython process the command
+                    await asyncio.sleep(0.2)
+                else:
+                    # For other sessions (bash, pdb, etc.)
+                    pyperclip.copy(code)
+                    # Send Ctrl+U to clear line, then paste
+                    await session.async_send_text('\x15')  # Ctrl+U
+                    await asyncio.sleep(0.1)
+                    await session.async_send_text(code)
+                    await session.async_send_text('\n')
+            else:
+                # Single line - send directly
+                await session.async_send_text(code)
+                await session.async_send_text('\n')
+
     try:
         if broadcast:
             # Broadcast to all sessions in current tab
             sessions = tab.sessions
             for session in sessions:
-                if is_ascii:
-                    # Send ASCII character
-                    ascii_code = ord(code) if len(code) == 1 else int(code)
-                    await session.async_send_text(chr(ascii_code))
-                else:
-                    # Send regular text
-                    if multiline:
-                        # For multiline content, copy to clipboard and paste
-                        pyperclip.copy(code)
-                        # Send Ctrl+U to clear line, then Cmd+V to paste
-                        await session.async_send_text('\x15')  # Ctrl+U
-                        await asyncio.sleep(0.1)
-                        # Use iTerm2's paste functionality
-                        await session.async_send_text(code)
-                        await session.async_send_text('\n')
-                    else:
-                        await session.async_send_text(code)
-                        await session.async_send_text('\n')
+                await send_to_session(session, code, is_ascii, multiline)
         else:
             # Send to specific pane or current session
             if target_pane is not None:
@@ -384,19 +409,7 @@ async def send_code_to_iterm(code, connection, target_pane=None, broadcast=False
             else:
                 session = tab.current_session
 
-            if is_ascii:
-                ascii_code = ord(code) if len(code) == 1 else int(code)
-                await session.async_send_text(chr(ascii_code))
-            else:
-                if multiline:
-                    pyperclip.copy(code)
-                    await session.async_send_text('\x15')  # Ctrl+U
-                    await asyncio.sleep(0.1)
-                    await session.async_send_text(code)
-                    await session.async_send_text('\n')
-                else:
-                    await session.async_send_text(code)
-                    await session.async_send_text('\n')
+            await send_to_session(session, code, is_ascii, multiline)
 
         return True
 
@@ -461,11 +474,13 @@ async def create_new_pane(connection):
 
 # HTTP Request Handlers
 
+
 async def handle_send_code(request, connection):
     """Enhanced handler for sending code with broadcast and targeting support"""
     try:
         data = await request.json()
         code = data.get('code', '')
+        # print(f"DEBUG: Received code repr: {repr(code)}")  # Add this line
         target_pane = data.get('target_pane')
         broadcast = data.get('broadcast', False)
         is_ascii = data.get('is_ascii', False)
@@ -474,22 +489,24 @@ async def handle_send_code(request, connection):
         if not code:
             return aiohttp.web.Response(text='No code provided', status=400)
 
-        success = await send_code_to_iterm(
-            code, connection, target_pane, broadcast, is_ascii, multiline
-        )
+        success = await send_code_to_iterm(code, connection, target_pane, broadcast,
+                                           is_ascii, multiline)
 
         if success:
             if broadcast:
-                return aiohttp.web.Response(text=f'Code broadcasted to all panes successfully')
+                return aiohttp.web.Response(
+                    text=f'Code broadcasted to all panes successfully')
             elif target_pane:
-                return aiohttp.web.Response(text=f'Code sent to pane {target_pane} successfully')
+                return aiohttp.web.Response(
+                    text=f'Code sent to pane {target_pane} successfully')
             else:
                 return aiohttp.web.Response(text='Code sent to current pane successfully')
         else:
             return aiohttp.web.Response(text='Failed to send code', status=500)
 
     except Exception as e:
-        return aiohttp.web.Response(text=f'Error processing request: {str(e)}', status=400)
+        return aiohttp.web.Response(text=f'Error processing request: {str(e)}',
+                                    status=400)
 
 
 async def handle_control(request, connection):
@@ -507,7 +524,8 @@ async def handle_control(request, connection):
             if success:
                 return aiohttp.web.Response(text=f'Selected pane {pane_number}')
             else:
-                return aiohttp.web.Response(text=f'Failed to select pane {pane_number}', status=500)
+                return aiohttp.web.Response(text=f'Failed to select pane {pane_number}',
+                                            status=500)
 
         elif action == 'new_pane':
             success = await create_new_pane(connection)
@@ -520,7 +538,8 @@ async def handle_control(request, connection):
             return aiohttp.web.Response(text='Unknown action', status=400)
 
     except Exception as e:
-        return aiohttp.web.Response(text=f'Error processing control request: {str(e)}', status=400)
+        return aiohttp.web.Response(text=f'Error processing control request: {str(e)}',
+                                    status=400)
 
 
 async def handle_breakpoint(request, connection):
@@ -529,7 +548,8 @@ async def handle_breakpoint(request, connection):
         break_info = await get_all_panes_info(connection)
         return aiohttp.web.json_response(break_info)
     except Exception as e:
-        return aiohttp.web.Response(text=f'Error getting breakpoint info: {str(e)}', status=500)
+        return aiohttp.web.Response(text=f'Error getting breakpoint info: {str(e)}',
+                                    status=500)
 
 
 async def main(connection):
@@ -547,10 +567,13 @@ async def main(connection):
     app.router.add_post('/control', control_handler)
 
     # Add CORS support for development
-    app.router.add_options('/{path:.*}', lambda request: aiohttp.web.Response(
-        headers={'Access-Control-Allow-Origin': '*',
+    app.router.add_options(
+        '/{path:.*}', lambda request: aiohttp.web.Response(
+            headers={
+                'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'}))
+                'Access-Control-Allow-Headers': 'Content-Type'
+            }))
 
     # Start the server
     runner = aiohttp.web.AppRunner(app)
