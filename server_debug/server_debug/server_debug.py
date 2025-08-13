@@ -38,10 +38,10 @@ def detect_session_type(lines):
     }
 
     # Check last few lines
-    recent_lines = [line.string.strip() for line in lines[-5:]]
+    recent_lines = reversed([line.string.strip() for line in lines[-5:]])
 
-    for session_type, patterns in session_indicators.items():
-        for line in recent_lines:
+    for line in recent_lines:
+        for session_type, patterns in session_indicators.items():
             for pattern in patterns:
                 if re.search(pattern, line):
                     return session_type
