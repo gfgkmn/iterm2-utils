@@ -33,7 +33,7 @@ def detect_session_type(lines):
             r'[^>]*@[^>]*:[^>]*\$ ',
             r'[^>]*:[^>]*\$ ',
             r'^yuhe\$',
-            r'^gfgkmn\\>: ',
+            r'^gfgkmn\\>:',
         ]
     }
 
@@ -181,17 +181,24 @@ def final_mappping(path_str):
     """Apply final path mappings"""
     if not path_str:
         return ""
+    update_path = ""
     mappings = {
         "/root/.cache/huggingface/modules/transformers_modules":
             "/root/workspace/crhavk47v38s73fnfgbg/dcformer",
+        "/home/yuhe/.cache/huggingface/modules/transformers_modules":
+            "/home/yuhe/dcformer",
+        "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify":
+            "/home/yuhe/dcformer-origin",
         "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify_format":
             "/home/yuhe/dcformer",
-        "/home/yuhe/.cache/huggingface/modules/transformers_modules":
+        "/data1/hub/modules/transformers_modules/global_step_594":
             "/home/yuhe/dcformer",
     }
     for old_path, new_path in mappings.items():
         if old_path in path_str:
-            path_str = path_str.replace(old_path, new_path)
+            update_path = path_str.replace(old_path, new_path)
+    if update_path:
+        return update_path
     return path_str
 
 
@@ -552,6 +559,40 @@ async def handle_breakpoint(request, connection):
                                     status=500)
 
 
+async def handle_screen_content(request, connection):
+    """Handler for getting current screen content"""
+    try:
+        app = await iterm2.async_get_app(connection)
+        window = app.current_terminal_window
+
+        if not window:
+            return aiohttp.web.json_response({'error': 'No active window'}, status=404)
+
+        tab = window.current_tab
+        if not tab:
+            return aiohttp.web.json_response({'error': 'No active tab'}, status=404)
+
+        session = tab.current_session
+        if not session:
+            return aiohttp.web.json_response({'error': 'No active session'}, status=404)
+
+        # Get screen content
+        line_info = await session.async_get_line_info()
+        lines = await session.async_get_contents(
+            first_line=line_info.first_visible_line_number,
+            number_of_lines=line_info.mutable_area_height)
+
+        # Reconstruct logical lines (handles line wrapping)
+        logical_lines = reconstruct_logical_lines(lines)
+        content = '\n'.join(logical_lines)
+
+        return aiohttp.web.json_response({'content': content})
+
+    except Exception as e:
+        return aiohttp.web.json_response(
+            {'error': f'Error getting screen content: {str(e)}'}, status=500)
+
+
 async def main(connection):
     """Main function to set up and run the web server"""
     app = aiohttp.web.Application()
@@ -560,11 +601,13 @@ async def main(connection):
     breakpoint_handler = partial(handle_breakpoint, connection=connection)
     send_code_handler = partial(handle_send_code, connection=connection)
     control_handler = partial(handle_control, connection=connection)
+    screen_content_handler = partial(handle_screen_content, connection=connection)
 
     # Set up routes
     app.router.add_get('/breakpoint', breakpoint_handler)
     app.router.add_post('/send_code', send_code_handler)
     app.router.add_post('/control', control_handler)
+    app.router.add_get('/screen_content', screen_content_handler)
 
     # Add CORS support for development
     app.router.add_options(
@@ -585,6 +628,7 @@ async def main(connection):
     print("  GET  /breakpoint - Get all pane information")
     print("  POST /send_code  - Send code to panes (supports broadcast and targeting)")
     print("  POST /control    - Control operations (select_pane, new_pane)")
+    print("  GET  /screen_content - Get current pane screen content")
 
     # Keep the server running
     while True:
