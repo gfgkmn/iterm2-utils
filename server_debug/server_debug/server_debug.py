@@ -187,6 +187,8 @@ def final_mappping(path_str):
             "/root/workspace/crhavk47v38s73fnfgbg/dcformer",
         "/home/yuhe/.cache/huggingface/modules/transformers_modules":
             "/home/yuhe/dcformer",
+        "/data1/hub/modules/transformers_modules":
+            "/home/yuhe/dcformer",
         "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify":
             "/home/yuhe/dcformer-origin",
         "/home/yuhe/.cache/huggingface/modules/transformers_modules/unify_format":
@@ -316,6 +318,8 @@ async def get_pane_info(connection, target_session):
                 else:
                     machine_str = job_args.split(' ')[-1]
 
+                machine_str = machine_str.strip('"').strip("'")
+
                 if is_host_in_config(machine_str, configs):
                     hostname = machine_str
                 else:
@@ -332,6 +336,9 @@ async def get_pane_info(connection, target_session):
                 hostname = job_args.split("@")[-1].split(":")[0]
             except (IndexError, AttributeError):
                 hostname = ""
+
+        if hostname:
+            hostname = hostname.strip('"').strip("'")  # ADD THIS LINE
 
         return {
             "username": username,
