@@ -166,6 +166,47 @@ def _build_hint_map(
     return hint_map
 
 
+def _build_hint_only_sequence(lines: List[iterm2.screen.LineContents],
+                               hint_map: Dict[Tuple[int, int], str]) -> str:
+    """Build escape sequence that only draws hints at specific positions."""
+    parts: List[str] = ["\0337"]  # Save cursor position
+
+    for (row, col), hint_char in hint_map.items():
+        # Move to position and draw hint
+        parts.append(f"\033[{row + 1};{col + 1}H")
+        parts.append("\033[1;97;100m")  # Bold bright white on dark grey
+        parts.append(hint_char)
+        parts.append("\033[0m")
+
+    parts.append("\0338")  # Restore cursor position
+    return ''.join(parts)
+
+
+def _build_restore_sequence(lines: List[iterm2.screen.LineContents],
+                            hint_map: Dict[Tuple[int, int], str]) -> str:
+    """Build escape sequence to restore only the cells that had hints."""
+    parts: List[str] = ["\0337"]  # Save cursor position
+
+    for (row, col) in hint_map.keys():
+        try:
+            cell_text = lines[row].string_at(col)
+            style = None
+            try:
+                style = lines[row].style_at(col)
+            except Exception:
+                pass
+
+            # Move to position and restore original character
+            parts.append(f"\033[{row + 1};{col + 1}H")
+            parts.append(_style_to_sgr(style))
+            parts.append(cell_text or ' ')
+        except (IndexError, Exception):
+            pass
+
+    parts.append("\033[0m\0338")  # Reset and restore cursor
+    return ''.join(parts)
+
+
 def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
                            hint_map: Optional[Dict[Tuple[int, int], str]] = None,
                            dim_non_hints: bool = False) -> str:
@@ -195,8 +236,8 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
                 pass
 
             if hint_map and key in hint_map:
-                # Highlighted hint: bold white on magenta
-                parts.append("\033[1;97;45m")
+                # Highlighted hint: bold bright white on dark grey
+                parts.append("\033[1;97;100m")
                 parts.append(hint_map[key])
                 parts.append("\033[0m")
             else:
@@ -208,8 +249,8 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
     return ''.join(parts)
 
 
-async def jump_to_position(connection, session, row: int, col: int):
-    """Jump to the specified position and enter Copy Mode."""
+async def jump_to_position(connection, session, row: int, col: int, auto_visual: bool = True):
+    """Jump to the specified position, enter Copy Mode, and optionally start visual selection."""
     try:
         lineInfo = await session.async_get_line_info()
         overflow = lineInfo.overflow
@@ -228,6 +269,7 @@ async def jump_to_position(connection, session, row: int, col: int):
 
         # Enter Copy Mode
         await iterm2.MainMenu.async_select_menu_item(connection, "Copy Mode")
+
     except Exception as e:
         print(f"Error jumping to position: {e}")
 
@@ -235,19 +277,10 @@ async def jump_to_position(connection, session, row: int, col: int):
 def _create_all_keys_pattern() -> iterm2.KeystrokePattern:
     """Create a pattern that matches all printable keys and Escape."""
     pattern = iterm2.KeystrokePattern()
-    # Match all letter keys (for hints and target char)
-    pattern.keycodes = [
-        iterm2.Keycode.ANSI_A, iterm2.Keycode.ANSI_B, iterm2.Keycode.ANSI_C,
-        iterm2.Keycode.ANSI_D, iterm2.Keycode.ANSI_E, iterm2.Keycode.ANSI_F,
-        iterm2.Keycode.ANSI_G, iterm2.Keycode.ANSI_H, iterm2.Keycode.ANSI_I,
-        iterm2.Keycode.ANSI_J, iterm2.Keycode.ANSI_K, iterm2.Keycode.ANSI_L,
-        iterm2.Keycode.ANSI_M, iterm2.Keycode.ANSI_N, iterm2.Keycode.ANSI_O,
-        iterm2.Keycode.ANSI_P, iterm2.Keycode.ANSI_Q, iterm2.Keycode.ANSI_R,
-        iterm2.Keycode.ANSI_S, iterm2.Keycode.ANSI_T, iterm2.Keycode.ANSI_U,
-        iterm2.Keycode.ANSI_V, iterm2.Keycode.ANSI_W, iterm2.Keycode.ANSI_X,
-        iterm2.Keycode.ANSI_Y, iterm2.Keycode.ANSI_Z,
-        iterm2.Keycode.ESCAPE,
-    ]
+    # Match all printable keys using characters instead of keycodes for broader coverage
+    # This catches any single printable character
+    pattern.characters = list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`~!@#$%^&*()-_=+[]{}\\|;:\'",.<>/?')
+    pattern.keycodes = [iterm2.Keycode.ESCAPE, iterm2.Keycode.SPACE]
     return pattern
 
 
@@ -288,10 +321,10 @@ async def ace_jump_interactive(connection, session):
                 await jump_to_position(connection, session, row, col)
                 return
 
-            # Build hint entries and original screen for restoration
+            # Build hint entries
             hint_entries = [((row, col), hint) for (row, col), hint in zip(positions, hints)]
-            original_sequence = _build_screen_sequence(lines)
             typed_prefix = ""
+            last_hint_map: Optional[Dict[Tuple[int, int], str]] = None
             restored = False
 
             try:
@@ -313,15 +346,25 @@ async def ace_jump_interactive(connection, session):
                         ]
                         if len(exact_matches) == 1:
                             (row, col), _ = exact_matches[0]
-                            await session.async_inject(original_sequence.encode('utf-8'))
+                            # Restore only the hint positions
+                            if last_hint_map:
+                                restore_sequence = _build_restore_sequence(lines, last_hint_map)
+                                await session.async_inject(restore_sequence.encode('utf-8'))
                             restored = True
                             await jump_to_position(connection, session, row, col)
                             return
 
-                    # Step 4: Display hints overlay
+                    # Step 4: Display hints overlay (only hints, no dimming)
                     hint_map = _build_hint_map(candidates)
-                    highlight_sequence = _build_screen_sequence(lines, hint_map=hint_map, dim_non_hints=True)
-                    await session.async_inject(highlight_sequence.encode('utf-8'))
+
+                    # Restore previous hints before drawing new ones (if hint set changed)
+                    if last_hint_map and last_hint_map != hint_map:
+                        restore_sequence = _build_restore_sequence(lines, last_hint_map)
+                        await session.async_inject(restore_sequence.encode('utf-8'))
+
+                    hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
+                    await session.async_inject(hint_only_sequence.encode('utf-8'))
+                    last_hint_map = hint_map
 
                     # Step 5: Capture hint character
                     keystroke = await mon.async_get()
@@ -337,8 +380,9 @@ async def ace_jump_interactive(connection, session):
                     typed_prefix += key.lower()[:1]
 
             finally:
-                if not restored:
-                    await session.async_inject(original_sequence.encode('utf-8'))
+                if not restored and last_hint_map:
+                    restore_sequence = _build_restore_sequence(lines, last_hint_map)
+                    await session.async_inject(restore_sequence.encode('utf-8'))
 
 
 async def main(connection):
