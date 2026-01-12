@@ -217,8 +217,6 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
         if cell_count == 0:
             continue
 
-        parts.append(f"\033[{row + 1};1H")  # Move to row start
-
         for col in range(cell_count):
             key = (row, col)
             try:
@@ -226,7 +224,11 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
             except IndexError:
                 break
 
+            # Move cursor to exact position for each character
+            parts.append(f"\033[{row + 1};{col + 1}H")
+
             if cell_text == "":
+                parts.append(" ")  # Draw space for empty cells
                 continue
 
             style = None
@@ -324,10 +326,16 @@ async def ace_jump_interactive(connection, session):
             # Build hint entries
             hint_entries = [((row, col), hint) for (row, col), hint in zip(positions, hints)]
             typed_prefix = ""
-            last_hint_map: Optional[Dict[Tuple[int, int], str]] = None
-            restored = False
+            jump_target: Optional[Tuple[int, int]] = None
+
+            # Switch to alternate screen buffer - main screen is preserved
+            await session.async_inject(b'\033[?1049h')
 
             try:
+                # Draw the original screen content on alternate buffer
+                base_screen = _build_screen_sequence(lines)
+                await session.async_inject(base_screen.encode('utf-8'))
+
                 while True:
                     # Filter candidates based on typed prefix
                     lower_prefix = typed_prefix.lower()
@@ -346,25 +354,13 @@ async def ace_jump_interactive(connection, session):
                         ]
                         if len(exact_matches) == 1:
                             (row, col), _ = exact_matches[0]
-                            # Restore only the hint positions
-                            if last_hint_map:
-                                restore_sequence = _build_restore_sequence(lines, last_hint_map)
-                                await session.async_inject(restore_sequence.encode('utf-8'))
-                            restored = True
-                            await jump_to_position(connection, session, row, col)
-                            return
+                            jump_target = (row, col)
+                            break
 
-                    # Step 4: Display hints overlay (only hints, no dimming)
+                    # Step 4: Display hints overlay on alternate screen
                     hint_map = _build_hint_map(candidates)
-
-                    # Restore previous hints before drawing new ones (if hint set changed)
-                    if last_hint_map and last_hint_map != hint_map:
-                        restore_sequence = _build_restore_sequence(lines, last_hint_map)
-                        await session.async_inject(restore_sequence.encode('utf-8'))
-
                     hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
                     await session.async_inject(hint_only_sequence.encode('utf-8'))
-                    last_hint_map = hint_map
 
                     # Step 5: Capture hint character
                     keystroke = await mon.async_get()
@@ -379,10 +375,17 @@ async def ace_jump_interactive(connection, session):
 
                     typed_prefix += key.lower()[:1]
 
+                    # Redraw base screen before showing updated hints
+                    await session.async_inject(base_screen.encode('utf-8'))
+
             finally:
-                if not restored and last_hint_map:
-                    restore_sequence = _build_restore_sequence(lines, last_hint_map)
-                    await session.async_inject(restore_sequence.encode('utf-8'))
+                # Switch back to main screen buffer - perfectly restores original
+                await session.async_inject(b'\033[?1049l')
+
+            # Jump after restoring screen
+            if jump_target:
+                row, col = jump_target
+                await jump_to_position(connection, session, row, col)
 
 
 async def main(connection):
