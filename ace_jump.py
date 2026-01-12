@@ -18,7 +18,7 @@ def generate_hints(count: int) -> List[str]:
     # Calculate the minimum length needed
     base = len(QWERTY_CHARS)
     length = 1
-    while base ** length < count:
+    while base**length < count:
         length += 1
 
     final_hints: List[str] = []
@@ -167,7 +167,7 @@ def _build_hint_map(
 
 
 def _build_hint_only_sequence(lines: List[iterm2.screen.LineContents],
-                               hint_map: Dict[Tuple[int, int], str]) -> str:
+                              hint_map: Dict[Tuple[int, int], str]) -> str:
     """Build escape sequence that only draws hints at specific positions."""
     parts: List[str] = ["\0337"]  # Save cursor position
 
@@ -251,7 +251,11 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
     return ''.join(parts)
 
 
-async def jump_to_position(connection, session, row: int, col: int, auto_visual: bool = True):
+async def jump_to_position(connection,
+                           session,
+                           row: int,
+                           col: int,
+                           auto_visual: bool = True):
     """Jump to the specified position, enter Copy Mode, and optionally start visual selection."""
     try:
         lineInfo = await session.async_get_line_info()
@@ -263,7 +267,8 @@ async def jump_to_position(connection, session, row: int, col: int, auto_visual:
 
         coordRange = iterm2.CoordRange(start, end)
         windowedCoordRange = iterm2.WindowedCoordRange(coordRange)
-        sub = iterm2.SubSelection(windowedCoordRange, iterm2.SelectionMode.CHARACTER, False)
+        sub = iterm2.SubSelection(windowedCoordRange, iterm2.SelectionMode.CHARACTER,
+                                  False)
         selection = iterm2.Selection([sub])
 
         await session.async_set_selection(selection)
@@ -281,7 +286,9 @@ def _create_all_keys_pattern() -> iterm2.KeystrokePattern:
     pattern = iterm2.KeystrokePattern()
     # Match all printable keys using characters instead of keycodes for broader coverage
     # This catches any single printable character
-    pattern.characters = list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`~!@#$%^&*()-_=+[]{}\\|;:\'",.<>/?')
+    pattern.characters = list(
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`~!@#$%^&*()-_=+[]{}\\|;:\'",.<>/?'
+    )
     pattern.keycodes = [iterm2.Keycode.ESCAPE, iterm2.Keycode.SPACE]
     return pattern
 
@@ -294,7 +301,8 @@ async def ace_jump_interactive(connection, session):
     filter_pattern = _create_all_keys_pattern()
 
     # Use KeystrokeFilter to intercept keys, KeystrokeMonitor to read them
-    async with iterm2.KeystrokeFilter(connection, [filter_pattern], session_id) as _filter:
+    async with iterm2.KeystrokeFilter(connection, [filter_pattern],
+                                      session_id) as _filter:
         async with iterm2.KeystrokeMonitor(connection, session_id) as mon:
             # Step 1: Capture target character
             keystroke = await mon.async_get()
@@ -324,7 +332,9 @@ async def ace_jump_interactive(connection, session):
                 return
 
             # Build hint entries
-            hint_entries = [((row, col), hint) for (row, col), hint in zip(positions, hints)]
+            hint_entries = [
+                ((row, col), hint) for (row, col), hint in zip(positions, hints)
+            ]
             typed_prefix = ""
             jump_target: Optional[Tuple[int, int]] = None
 
@@ -350,7 +360,8 @@ async def ace_jump_interactive(connection, session):
                     # Check for exact match
                     if lower_prefix:
                         exact_matches = [
-                            entry for entry in candidates if entry[1].lower() == lower_prefix
+                            entry for entry in candidates
+                            if entry[1].lower() == lower_prefix
                         ]
                         if len(exact_matches) == 1:
                             (row, col), _ = exact_matches[0]

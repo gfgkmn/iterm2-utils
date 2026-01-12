@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 
-import iterm2
 import asyncio
 
+import iterm2
+
+
 async def main(connection):
-    app=await iterm2.async_get_app(connection)
-    window=app.current_terminal_window
+    app = await iterm2.async_get_app(connection)
+    window = app.current_terminal_window
     if window is not None:
         # tab=await window.async_create_tab()
         tab = window.current_tab
@@ -18,5 +20,6 @@ async def main(connection):
                 await session.async_split_pane(vertical=False)
     else:
         print("No Current Window")
+
 
 iterm2.run_until_complete(main)
