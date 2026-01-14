@@ -6,49 +6,72 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import iterm2
 import iterm2.screen
 
+# Set to True to enable debug output
+DEBUG = False
+
+
+def debug_print(msg: str):
+    """Print debug message if DEBUG is enabled."""
+    if DEBUG:
+        print(msg)
+
 
 async def should_use_alt_screen(session) -> bool:
     """Check if it's safe to use alternate screen buffer.
 
     Returns False if in tmux or other multiplexer (use direct overlay instead).
     """
+    debug_print("[DEBUG] should_use_alt_screen: checking environment...")
+
     try:
         # Check TERM variable - tmux/screen set specific values
         term = await session.async_get_variable("user.TERM")
+        debug_print(f"[DEBUG] TERM = {term}")
         if term:
             term_lower = term.lower()
             # tmux and screen use these TERM values
             if any(x in term_lower for x in ["tmux", "screen"]):
+                debug_print("[DEBUG] Detected tmux/screen via TERM, using direct overlay")
                 return False
-    except Exception:
-        pass
+    except Exception as e:
+        debug_print(f"[DEBUG] Error getting TERM: {e}")
 
     try:
         # Check session name for tmux indicators
         name = await session.async_get_variable("session.name")
+        debug_print(f"[DEBUG] session.name = {name}")
         if name and "tmux" in name.lower():
+            debug_print("[DEBUG] Detected tmux via session.name, using direct overlay")
             return False
-    except Exception:
-        pass
+    except Exception as e:
+        debug_print(f"[DEBUG] Error getting session.name: {e}")
 
     try:
         # Check job name - tmux shows up here
         job = await session.async_get_variable("jobName")
+        debug_print(f"[DEBUG] jobName = {job}")
         if job and "tmux" in job.lower():
+            debug_print("[DEBUG] Detected tmux via jobName, using direct overlay")
             return False
-    except Exception:
-        pass
+        # If SSH, assume remote might have tmux - use direct overlay to be safe
+        if job and job.lower() == "ssh":
+            debug_print("[DEBUG] Detected SSH session, using direct overlay (remote might have tmux)")
+            return False
+    except Exception as e:
+        debug_print(f"[DEBUG] Error getting jobName: {e}")
 
     try:
         # Check TTY for pts which might indicate nested session
         tty = await session.async_get_variable("session.tty")
+        debug_print(f"[DEBUG] session.tty = {tty}")
         if tty:
             # Additional heuristic could go here
             pass
-    except Exception:
-        pass
+    except Exception as e:
+        debug_print(f"[DEBUG] Error getting session.tty: {e}")
 
     # Default to using alternate screen if no multiplexer detected
+    debug_print("[DEBUG] No multiplexer detected, using alternate screen buffer")
     return True
 
 # QWERTY keyboard order for hints (home row first, then numbers)
@@ -105,6 +128,8 @@ def find_char_positions(lines: List[iterm2.screen.LineContents],
     matches: List[Tuple[int, int]] = []
     needle = target_char.lower()
 
+    debug_print(f"[DEBUG] find_char_positions: searching for '{target_char}' in {len(lines)} lines")
+
     for row, line in enumerate(lines):
         col = 0
         while True:
@@ -121,6 +146,10 @@ def find_char_positions(lines: List[iterm2.screen.LineContents],
             if first_char.strip() and first_char.lower() == needle:
                 matches.append((row, col))
             col += 1
+
+    debug_print(f"[DEBUG] find_char_positions: found {len(matches)} matches")
+    if matches:
+        debug_print(f"[DEBUG] find_char_positions: first few matches: {matches[:5]}")
 
     return matches
 
@@ -191,13 +220,50 @@ def _style_to_sgr(style, extra: Optional[List[str]] = None) -> str:
     return f"\033[{';'.join(codes)}m"
 
 
-async def get_screen_content(session) -> List[iterm2.screen.LineContents]:
-    """Get the visible screen content from the session."""
+async def get_screen_content(session) -> Tuple[List[iterm2.screen.LineContents], int]:
+    """Get the visible screen content from the session.
+
+    Returns:
+        Tuple of (lines, scrollback_height) where:
+        - lines: Screen content lines (mutable area)
+        - scrollback_height: Height of scrollback buffer
+
+    The mutable area starts right after the scrollback buffer, so
+    row N on screen = scrollback_height + N in selection coordinates.
+    """
     contents = await session.async_get_screen_contents()
+    lineInfo = await session.async_get_line_info()
     lines: List[iterm2.screen.LineContents] = []
     for i in range(contents.number_of_lines):
         lines.append(contents.line(i))
-    return lines
+
+    # Debug info
+    debug_print(f"[DEBUG] ScreenContents.number_of_lines: {contents.number_of_lines}")
+    debug_print(f"[DEBUG] ScreenContents.number_of_lines_above_screen: {contents.number_of_lines_above_screen}")
+    debug_print(f"[DEBUG] LineInfo.first_visible_line_number: {lineInfo.first_visible_line_number}")
+    debug_print(f"[DEBUG] LineInfo.overflow: {lineInfo.overflow}")
+    debug_print(f"[DEBUG] LineInfo.scrollback_buffer_height: {lineInfo.scrollback_buffer_height}")
+    debug_print(f"[DEBUG] LineInfo.mutable_area_height: {lineInfo.mutable_area_height}")
+
+    # Print first 20 chars of first few and last few lines to see what's in screen content
+    debug_print(f"[DEBUG] Screen content preview:")
+    for i in [0, 1, 2, len(lines)-3, len(lines)-2, len(lines)-1]:
+        if 0 <= i < len(lines):
+            line_preview = ""
+            for col in range(min(40, 200)):
+                try:
+                    c = lines[i].string_at(col)
+                    line_preview += c if c else " "
+                except IndexError:
+                    break
+            debug_print(f"[DEBUG]   line[{i}]: '{line_preview}'")
+
+    # Selection coordinates include overflow, so mutable area starts at:
+    # overflow + scrollback_buffer_height
+    mutable_area_start = lineInfo.overflow + lineInfo.scrollback_buffer_height
+    debug_print(f"[DEBUG] Calculated mutable_area_start: {mutable_area_start} ({lineInfo.overflow}+{lineInfo.scrollback_buffer_height})")
+
+    return lines, mutable_area_start
 
 
 def _line_cell_count(line: iterm2.screen.LineContents) -> int:
@@ -352,15 +418,39 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
 async def jump_to_position(connection,
                            session,
                            row: int,
-                           col: int):
-    """Jump to the specified position and enter Copy Mode."""
-    try:
-        lineInfo = await session.async_get_line_info()
-        overflow = lineInfo.overflow
-        first = lineInfo.first_visible_line_number
+                           col: int,
+                           mutable_area_start: int):
+    """Jump to the specified position and enter Copy Mode.
 
-        start = iterm2.Point(col, first + overflow + row)
-        end = iterm2.Point(col, first + overflow + row)
+    Args:
+        connection: iTerm2 connection
+        session: iTerm2 session
+        row: Screen-relative row (0-indexed from top of mutable area)
+        col: Column position
+        mutable_area_start: Selection coordinate where mutable area begins (overflow + scrollback_height)
+    """
+    try:
+        # The mutable area starts at mutable_area_start in selection coordinates
+        # So row N on screen = mutable_area_start + N
+        absolute_line = mutable_area_start + row
+
+        # Get fresh line info right before jumping for accurate coordinates
+        fresh_lineInfo = await session.async_get_line_info()
+        fresh_start = fresh_lineInfo.overflow + fresh_lineInfo.scrollback_buffer_height
+
+        # Use fresh values for the actual jump
+        absolute_line = fresh_start + row
+
+        # Debug info
+        debug_print(f"[DEBUG] jump_to_position: row={row}, col={col}")
+        debug_print(f"[DEBUG] jump_to_position: cached mutable_area_start={mutable_area_start}")
+        debug_print(f"[DEBUG] jump_to_position: fresh mutable_area_start={fresh_start}")
+        debug_print(f"[DEBUG] jump_to_position: absolute_line={absolute_line} ({fresh_start}+{row})")
+        if fresh_start != mutable_area_start:
+            debug_print(f"[DEBUG] WARNING: mutable_area_start changed! Was {mutable_area_start}, now {fresh_start}")
+
+        start = iterm2.Point(col, absolute_line)
+        end = iterm2.Point(col, absolute_line)
 
         coordRange = iterm2.CoordRange(start, end)
         windowedCoordRange = iterm2.WindowedCoordRange(coordRange)
@@ -390,8 +480,9 @@ def _create_all_keys_pattern() -> iterm2.KeystrokePattern:
     return pattern
 
 
-async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, hints):
+async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, hints, mutable_area_start: int):
     """Ace jump using alternate screen buffer (for non-tmux)."""
+    debug_print("[DEBUG] _ace_jump_with_alt_screen: using alternate screen buffer mode")
     typed_prefix = ""
     jump_target: Optional[Tuple[int, int]] = None
 
@@ -448,13 +539,15 @@ async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, 
     return jump_target
 
 
-async def _ace_jump_direct_overlay(connection, session, mon, lines, positions, hints):
+async def _ace_jump_direct_overlay(connection, session, mon, lines, positions, hints, mutable_area_start: int):
     """Ace jump using direct hint overlay with restore (for tmux)."""
+    debug_print("[DEBUG] _ace_jump_direct_overlay: using direct overlay mode (tmux/multiplexer)")
     typed_prefix = ""
     jump_target: Optional[Tuple[int, int]] = None
 
     # All target positions need restoration (each hint only modifies its target pos)
     all_positions: set = set(positions)
+    debug_print(f"[DEBUG] _ace_jump_direct_overlay: {len(all_positions)} positions to track for restoration")
 
     try:
         while True:
@@ -526,7 +619,8 @@ async def ace_jump_interactive(connection, session):
                 return
 
             # Step 2: Get screen content and find positions
-            lines = await get_screen_content(session)
+            # Capture mutable_area_start (overflow + scrollback_height) for coordinate calculation
+            lines, mutable_area_start = await get_screen_content(session)
             positions = find_char_positions(lines, target_char)
 
             if not positions:
@@ -538,25 +632,43 @@ async def ace_jump_interactive(connection, session):
             # If only one match, jump directly
             if len(positions) == 1:
                 row, col = positions[0]
-                await jump_to_position(connection, session, row, col)
+                # Debug: show target line content
+                target_line = ""
+                for c in range(min(60, 200)):
+                    try:
+                        ch = lines[row].string_at(c)
+                        target_line += ch if ch else " "
+                    except IndexError:
+                        break
+                debug_print(f"[DEBUG] Target line[{row}] content: '{target_line}'")
+                await jump_to_position(connection, session, row, col, mutable_area_start)
                 return
 
             # Use different approach based on environment
             if use_alt_screen:
                 # Normal: use alternate screen buffer (clean restoration)
                 jump_target = await _ace_jump_with_alt_screen(
-                    connection, session, mon, lines, positions, hints
+                    connection, session, mon, lines, positions, hints, mutable_area_start
                 )
             else:
                 # tmux/multiplexer: use direct overlay (no alternate screen)
                 jump_target = await _ace_jump_direct_overlay(
-                    connection, session, mon, lines, positions, hints
+                    connection, session, mon, lines, positions, hints, mutable_area_start
                 )
 
             # Jump after restoring screen
             if jump_target:
                 row, col = jump_target
-                await jump_to_position(connection, session, row, col)
+                # Debug: show target line content
+                target_line = ""
+                for c in range(min(60, 200)):
+                    try:
+                        ch = lines[row].string_at(c)
+                        target_line += ch if ch else " "
+                    except IndexError:
+                        break
+                debug_print(f"[DEBUG] Target line[{row}] content: '{target_line}'")
+                await jump_to_position(connection, session, row, col, mutable_area_start)
 
 
 async def main(connection):
