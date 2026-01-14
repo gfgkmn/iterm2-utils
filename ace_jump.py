@@ -6,6 +6,51 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import iterm2
 import iterm2.screen
 
+
+async def should_use_alt_screen(session) -> bool:
+    """Check if it's safe to use alternate screen buffer.
+
+    Returns False if in tmux or other multiplexer (use direct overlay instead).
+    """
+    try:
+        # Check TERM variable - tmux/screen set specific values
+        term = await session.async_get_variable("user.TERM")
+        if term:
+            term_lower = term.lower()
+            # tmux and screen use these TERM values
+            if any(x in term_lower for x in ["tmux", "screen"]):
+                return False
+    except Exception:
+        pass
+
+    try:
+        # Check session name for tmux indicators
+        name = await session.async_get_variable("session.name")
+        if name and "tmux" in name.lower():
+            return False
+    except Exception:
+        pass
+
+    try:
+        # Check job name - tmux shows up here
+        job = await session.async_get_variable("jobName")
+        if job and "tmux" in job.lower():
+            return False
+    except Exception:
+        pass
+
+    try:
+        # Check TTY for pts which might indicate nested session
+        tty = await session.async_get_variable("session.tty")
+        if tty:
+            # Additional heuristic could go here
+            pass
+    except Exception:
+        pass
+
+    # Default to using alternate screen if no multiplexer detected
+    return True
+
 # QWERTY keyboard order for hints (home row first)
 QWERTY_CHARS = 'asdfghjklqwertyuiopzxcvbnm'
 
@@ -293,9 +338,141 @@ def _create_all_keys_pattern() -> iterm2.KeystrokePattern:
     return pattern
 
 
+async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, hints):
+    """Ace jump using alternate screen buffer (for non-tmux)."""
+    hint_entries = [
+        ((row, col), hint) for (row, col), hint in zip(positions, hints)
+    ]
+    typed_prefix = ""
+    jump_target: Optional[Tuple[int, int]] = None
+
+    # Switch to alternate screen buffer - main screen is preserved
+    await session.async_inject(b'\033[?1049h')
+
+    try:
+        # Draw the original screen content on alternate buffer
+        base_screen = _build_screen_sequence(lines)
+        await session.async_inject(base_screen.encode('utf-8'))
+
+        while True:
+            # Filter candidates based on typed prefix
+            lower_prefix = typed_prefix.lower()
+            candidates = [
+                entry for entry in hint_entries
+                if entry[1].lower().startswith(lower_prefix)
+            ]
+
+            if not candidates:
+                break
+
+            # Check for exact match
+            if lower_prefix:
+                exact_matches = [
+                    entry for entry in candidates
+                    if entry[1].lower() == lower_prefix
+                ]
+                if len(exact_matches) == 1:
+                    (row, col), _ = exact_matches[0]
+                    jump_target = (row, col)
+                    break
+
+            # Display hints overlay on alternate screen
+            hint_map = _build_hint_map(candidates)
+            hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
+            await session.async_inject(hint_only_sequence.encode('utf-8'))
+
+            # Capture hint character
+            keystroke = await mon.async_get()
+
+            # Handle Escape to cancel
+            if keystroke.keycode == iterm2.Keycode.ESCAPE:
+                break
+
+            key = keystroke.characters
+            if not key:
+                continue
+
+            typed_prefix += key.lower()[:1]
+
+            # Redraw base screen before showing updated hints
+            await session.async_inject(base_screen.encode('utf-8'))
+
+    finally:
+        # Switch back to main screen buffer - perfectly restores original
+        await session.async_inject(b'\033[?1049l')
+
+    return jump_target
+
+
+async def _ace_jump_direct_overlay(connection, session, mon, lines, positions, hints):
+    """Ace jump using direct hint overlay with restore (for tmux)."""
+    hint_entries = [
+        ((row, col), hint) for (row, col), hint in zip(positions, hints)
+    ]
+    typed_prefix = ""
+    jump_target: Optional[Tuple[int, int]] = None
+    all_modified_positions: Dict[Tuple[int, int], str] = {}
+
+    try:
+        while True:
+            # Filter candidates based on typed prefix
+            lower_prefix = typed_prefix.lower()
+            candidates = [
+                entry for entry in hint_entries
+                if entry[1].lower().startswith(lower_prefix)
+            ]
+
+            if not candidates:
+                break
+
+            # Check for exact match
+            if lower_prefix:
+                exact_matches = [
+                    entry for entry in candidates
+                    if entry[1].lower() == lower_prefix
+                ]
+                if len(exact_matches) == 1:
+                    (row, col), _ = exact_matches[0]
+                    jump_target = (row, col)
+                    break
+
+            # Display hints overlay directly on screen
+            hint_map = _build_hint_map(candidates)
+            all_modified_positions.update(hint_map)
+            hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
+            await session.async_inject(hint_only_sequence.encode('utf-8'))
+
+            # Capture hint character
+            keystroke = await mon.async_get()
+
+            # Handle Escape to cancel
+            if keystroke.keycode == iterm2.Keycode.ESCAPE:
+                break
+
+            key = keystroke.characters
+            if not key:
+                continue
+
+            typed_prefix += key.lower()[:1]
+
+            # Restore modified positions before showing updated hints
+            if all_modified_positions:
+                restore_seq = _build_restore_sequence(lines, all_modified_positions)
+                await session.async_inject(restore_seq.encode('utf-8'))
+
+    finally:
+        # Restore all modified positions
+        if all_modified_positions:
+            restore_seq = _build_restore_sequence(lines, all_modified_positions)
+            await session.async_inject(restore_seq.encode('utf-8'))
+
+    return jump_target
+
+
 async def ace_jump_interactive(connection, session):
     """Interactive ace jump using KeystrokeMonitor and KeystrokeFilter."""
     session_id = session.session_id
+    use_alt_screen = await should_use_alt_screen(session)
 
     # Create filter pattern to prevent keystrokes from reaching terminal
     filter_pattern = _create_all_keys_pattern()
@@ -331,67 +508,17 @@ async def ace_jump_interactive(connection, session):
                 await jump_to_position(connection, session, row, col)
                 return
 
-            # Build hint entries
-            hint_entries = [
-                ((row, col), hint) for (row, col), hint in zip(positions, hints)
-            ]
-            typed_prefix = ""
-            jump_target: Optional[Tuple[int, int]] = None
-
-            # Switch to alternate screen buffer - main screen is preserved
-            await session.async_inject(b'\033[?1049h')
-
-            try:
-                # Draw the original screen content on alternate buffer
-                base_screen = _build_screen_sequence(lines)
-                await session.async_inject(base_screen.encode('utf-8'))
-
-                while True:
-                    # Filter candidates based on typed prefix
-                    lower_prefix = typed_prefix.lower()
-                    candidates = [
-                        entry for entry in hint_entries
-                        if entry[1].lower().startswith(lower_prefix)
-                    ]
-
-                    if not candidates:
-                        break
-
-                    # Check for exact match
-                    if lower_prefix:
-                        exact_matches = [
-                            entry for entry in candidates
-                            if entry[1].lower() == lower_prefix
-                        ]
-                        if len(exact_matches) == 1:
-                            (row, col), _ = exact_matches[0]
-                            jump_target = (row, col)
-                            break
-
-                    # Step 4: Display hints overlay on alternate screen
-                    hint_map = _build_hint_map(candidates)
-                    hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
-                    await session.async_inject(hint_only_sequence.encode('utf-8'))
-
-                    # Step 5: Capture hint character
-                    keystroke = await mon.async_get()
-
-                    # Handle Escape to cancel
-                    if keystroke.keycode == iterm2.Keycode.ESCAPE:
-                        break
-
-                    key = keystroke.characters
-                    if not key:
-                        continue
-
-                    typed_prefix += key.lower()[:1]
-
-                    # Redraw base screen before showing updated hints
-                    await session.async_inject(base_screen.encode('utf-8'))
-
-            finally:
-                # Switch back to main screen buffer - perfectly restores original
-                await session.async_inject(b'\033[?1049l')
+            # Use different approach based on environment
+            if use_alt_screen:
+                # Normal: use alternate screen buffer (clean restoration)
+                jump_target = await _ace_jump_with_alt_screen(
+                    connection, session, mon, lines, positions, hints
+                )
+            else:
+                # tmux/multiplexer: use direct overlay (no alternate screen)
+                jump_target = await _ace_jump_direct_overlay(
+                    connection, session, mon, lines, positions, hints
+                )
 
             # Jump after restoring screen
             if jump_target:
