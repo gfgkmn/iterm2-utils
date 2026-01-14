@@ -51,19 +51,24 @@ async def should_use_alt_screen(session) -> bool:
     # Default to using alternate screen if no multiplexer detected
     return True
 
-# QWERTY keyboard order for hints (home row first)
-QWERTY_CHARS = 'asdfghjklqwertyuiopzxcvbnm'
+# QWERTY keyboard order for hints (home row first, then numbers)
+# Extended set for more single-char hints
+HINT_CHARS = 'asdfghjklqwertyuiopzxcvbnm1234567890'
 
 
 def generate_hints(count: int) -> List[str]:
-    """Generate hint labels in QWERTY order with equal length."""
+    """Generate hint labels in QWERTY order.
+
+    Uses single chars when possible, multi-char when needed.
+    """
     if count == 0:
         return []
 
-    # Calculate the minimum length needed
-    base = len(QWERTY_CHARS)
+    base = len(HINT_CHARS)
+
+    # Calculate minimum length needed
     length = 1
-    while base**length < count:
+    while base ** length < count:
         length += 1
 
     final_hints: List[str] = []
@@ -73,13 +78,25 @@ def generate_hints(count: int) -> List[str]:
             final_hints.append(prefix)
             return len(final_hints) < count
 
-        for char in QWERTY_CHARS:
+        for char in HINT_CHARS:
             if not generate_fixed_length(prefix + char, remaining_length - 1):
                 return False
         return True
 
     generate_fixed_length('', length)
     return final_hints[:count]
+
+
+def get_hint_char_to_show(hint: str, typed_prefix: str) -> str:
+    """Get the next character to show for a hint given what's been typed.
+
+    This enables progressive disclosure - only show one char at a time
+    to avoid overlaps with adjacent targets.
+    """
+    prefix_len = len(typed_prefix)
+    if prefix_len < len(hint):
+        return hint[prefix_len].upper()
+    return ""
 
 
 def find_char_positions(lines: List[iterm2.screen.LineContents],
@@ -198,17 +215,44 @@ def _line_cell_count(line: iterm2.screen.LineContents) -> int:
     return count
 
 
-def _build_hint_map(
-        active: Iterable[Tuple[Tuple[int, int], str]]) -> Dict[Tuple[int, int], str]:
-    hint_map: Dict[Tuple[int, int], str] = {}
-    for (row, col), hint in active:
-        if not hint:
+def get_matching_positions(
+        positions: List[Tuple[int, int]],
+        hints: List[str],
+        typed_prefix: str
+) -> Tuple[List[Tuple[Tuple[int, int], str]], Optional[Tuple[int, int]]]:
+    """Get positions matching typed prefix and check for exact match.
+
+    Returns:
+        - List of (position, next_char_to_show) for hints matching prefix
+        - If exactly one hint matches completely, returns that position as second element
+    """
+    matches: List[Tuple[Tuple[int, int], str]] = []
+    exact_match: Optional[Tuple[int, int]] = None
+    lower_prefix = typed_prefix.lower()
+
+    for (row, col), hint in zip(positions, hints):
+        hint_lower = hint.lower()
+        # Only include hints that match typed prefix
+        if not hint_lower.startswith(lower_prefix):
             continue
-        for index, char in enumerate(hint.upper()):
-            key = (row, col + index)
-            if key not in hint_map:
-                hint_map[key] = char
-    return hint_map
+
+        # Check for exact match
+        if hint_lower == lower_prefix:
+            exact_match = (row, col)
+
+        # Get the next character to show
+        char_to_show = get_hint_char_to_show(hint, typed_prefix)
+        if char_to_show:
+            matches.append(((row, col), char_to_show))
+
+    return matches, exact_match
+
+
+def build_single_char_hint_map(
+        matches: List[Tuple[Tuple[int, int], str]]
+) -> Dict[Tuple[int, int], str]:
+    """Build hint map from matches list."""
+    return {pos: char for pos, char in matches}
 
 
 def _build_hint_only_sequence(lines: List[iterm2.screen.LineContents],
@@ -228,11 +272,17 @@ def _build_hint_only_sequence(lines: List[iterm2.screen.LineContents],
 
 
 def _build_restore_sequence(lines: List[iterm2.screen.LineContents],
-                            hint_map: Dict[Tuple[int, int], str]) -> str:
-    """Build escape sequence to restore only the cells that had hints."""
+                            positions: set) -> str:
+    """Build escape sequence to restore cells at given positions."""
     parts: List[str] = ["\0337"]  # Save cursor position
 
-    for (row, col) in hint_map.keys():
+    # Sort positions for consistent order
+    sorted_positions = sorted(positions, key=lambda p: (p[0], p[1]))
+
+    for (row, col) in sorted_positions:
+        # Move to position
+        parts.append(f"\033[{row + 1};{col + 1}H")
+
         try:
             cell_text = lines[row].string_at(col)
             style = None
@@ -241,14 +291,17 @@ def _build_restore_sequence(lines: List[iterm2.screen.LineContents],
             except Exception:
                 pass
 
-            # Move to position and restore original character
-            parts.append(f"\033[{row + 1};{col + 1}H")
+            # Restore with original style
             parts.append(_style_to_sgr(style))
-            parts.append(cell_text or ' ')
+            parts.append(cell_text if cell_text else ' ')
         except (IndexError, Exception):
-            pass
+            # Clear with reset if can't get original
+            parts.append("\033[0m ")
 
-    parts.append("\033[0m\0338")  # Reset and restore cursor
+        # Reset after each char
+        parts.append("\033[0m")
+
+    parts.append("\0338")  # Restore cursor position
     return ''.join(parts)
 
 
@@ -299,9 +352,8 @@ def _build_screen_sequence(lines: List[iterm2.screen.LineContents],
 async def jump_to_position(connection,
                            session,
                            row: int,
-                           col: int,
-                           auto_visual: bool = True):
-    """Jump to the specified position, enter Copy Mode, and optionally start visual selection."""
+                           col: int):
+    """Jump to the specified position and enter Copy Mode."""
     try:
         lineInfo = await session.async_get_line_info()
         overflow = lineInfo.overflow
@@ -340,9 +392,6 @@ def _create_all_keys_pattern() -> iterm2.KeystrokePattern:
 
 async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, hints):
     """Ace jump using alternate screen buffer (for non-tmux)."""
-    hint_entries = [
-        ((row, col), hint) for (row, col), hint in zip(positions, hints)
-    ]
     typed_prefix = ""
     jump_target: Optional[Tuple[int, int]] = None
 
@@ -355,29 +404,24 @@ async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, 
         await session.async_inject(base_screen.encode('utf-8'))
 
         while True:
-            # Filter candidates based on typed prefix
-            lower_prefix = typed_prefix.lower()
-            candidates = [
-                entry for entry in hint_entries
-                if entry[1].lower().startswith(lower_prefix)
-            ]
+            # Get matching positions and check for exact match
+            matches, exact_match = get_matching_positions(positions, hints, typed_prefix)
 
-            if not candidates:
+            # If exact match found, jump there
+            if exact_match:
+                jump_target = exact_match
                 break
 
-            # Check for exact match
-            if lower_prefix:
-                exact_matches = [
-                    entry for entry in candidates
-                    if entry[1].lower() == lower_prefix
-                ]
-                if len(exact_matches) == 1:
-                    (row, col), _ = exact_matches[0]
-                    jump_target = (row, col)
-                    break
+            if not matches:
+                break
+
+            # Check if only one candidate left - jump directly
+            if len(matches) == 1:
+                jump_target = matches[0][0]
+                break
 
             # Display hints overlay on alternate screen
-            hint_map = _build_hint_map(candidates)
+            hint_map = build_single_char_hint_map(matches)
             hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
             await session.async_inject(hint_only_sequence.encode('utf-8'))
 
@@ -406,39 +450,32 @@ async def _ace_jump_with_alt_screen(connection, session, mon, lines, positions, 
 
 async def _ace_jump_direct_overlay(connection, session, mon, lines, positions, hints):
     """Ace jump using direct hint overlay with restore (for tmux)."""
-    hint_entries = [
-        ((row, col), hint) for (row, col), hint in zip(positions, hints)
-    ]
     typed_prefix = ""
     jump_target: Optional[Tuple[int, int]] = None
-    all_modified_positions: Dict[Tuple[int, int], str] = {}
+
+    # All target positions need restoration (each hint only modifies its target pos)
+    all_positions: set = set(positions)
 
     try:
         while True:
-            # Filter candidates based on typed prefix
-            lower_prefix = typed_prefix.lower()
-            candidates = [
-                entry for entry in hint_entries
-                if entry[1].lower().startswith(lower_prefix)
-            ]
+            # Get matching positions and check for exact match
+            matches, exact_match = get_matching_positions(positions, hints, typed_prefix)
 
-            if not candidates:
+            # If exact match found, jump there
+            if exact_match:
+                jump_target = exact_match
                 break
 
-            # Check for exact match
-            if lower_prefix:
-                exact_matches = [
-                    entry for entry in candidates
-                    if entry[1].lower() == lower_prefix
-                ]
-                if len(exact_matches) == 1:
-                    (row, col), _ = exact_matches[0]
-                    jump_target = (row, col)
-                    break
+            if not matches:
+                break
 
-            # Display hints overlay directly on screen
-            hint_map = _build_hint_map(candidates)
-            all_modified_positions.update(hint_map)
+            # Check if only one candidate left - jump directly
+            if len(matches) == 1:
+                jump_target = matches[0][0]
+                break
+
+            # Display hints overlay
+            hint_map = build_single_char_hint_map(matches)
             hint_only_sequence = _build_hint_only_sequence(lines, hint_map)
             await session.async_inject(hint_only_sequence.encode('utf-8'))
 
@@ -455,16 +492,12 @@ async def _ace_jump_direct_overlay(connection, session, mon, lines, positions, h
 
             typed_prefix += key.lower()[:1]
 
-            # Restore modified positions before showing updated hints
-            if all_modified_positions:
-                restore_seq = _build_restore_sequence(lines, all_modified_positions)
-                await session.async_inject(restore_seq.encode('utf-8'))
-
     finally:
-        # Restore all modified positions
-        if all_modified_positions:
-            restore_seq = _build_restore_sequence(lines, all_modified_positions)
+        # Restore all target positions
+        if all_positions:
+            restore_seq = _build_restore_sequence(lines, all_positions)
             await session.async_inject(restore_seq.encode('utf-8'))
+            await asyncio.sleep(0.05)
 
     return jump_target
 
