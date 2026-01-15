@@ -225,7 +225,7 @@ async def get_screen_content(session) -> Tuple[List[iterm2.screen.LineContents],
 
     Returns:
         Tuple of (lines, scrollback_height) where:
-        - lines: Screen content lines (mutable area)
+        - lines: Screen content lines (mutable area) with style info
         - scrollback_height: Height of scrollback buffer
 
     The mutable area starts right after the scrollback buffer, so
@@ -339,7 +339,11 @@ def _build_hint_only_sequence(lines: List[iterm2.screen.LineContents],
 
 def _build_restore_sequence(lines: List[iterm2.screen.LineContents],
                             positions: set) -> str:
-    """Build escape sequence to restore cells at given positions."""
+    """Build escape sequence to restore cells at given positions.
+
+    Note: Style/color restoration requires a newer iTerm2 Python library with
+    style_at() support. Without it, characters are restored with default style.
+    """
     parts: List[str] = ["\0337"]  # Save cursor position
 
     # Sort positions for consistent order
@@ -351,16 +355,24 @@ def _build_restore_sequence(lines: List[iterm2.screen.LineContents],
 
         try:
             cell_text = lines[row].string_at(col)
-            style = None
-            try:
-                style = lines[row].style_at(col)
-            except Exception:
-                pass
 
-            # Restore with original style
-            parts.append(_style_to_sgr(style))
+            # Try to get style if available (requires newer iterm2 library)
+            style = None
+            if hasattr(lines[row], 'style_at'):
+                try:
+                    style = lines[row].style_at(col)
+                    debug_print(f"[DEBUG] restore: row={row}, col={col}, char='{cell_text}', style={style}")
+                except Exception as e:
+                    debug_print(f"[DEBUG] restore: style_at failed: {e}")
+            else:
+                debug_print(f"[DEBUG] restore: style_at not available (old iterm2 library)")
+
+            # Restore with original style (or default if not available)
+            sgr = _style_to_sgr(style)
+            parts.append(sgr)
             parts.append(cell_text if cell_text else ' ')
-        except (IndexError, Exception):
+        except (IndexError, Exception) as e:
+            debug_print(f"[DEBUG] restore: failed to get cell: {e}")
             # Clear with reset if can't get original
             parts.append("\033[0m ")
 
