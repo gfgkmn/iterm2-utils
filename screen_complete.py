@@ -422,10 +422,15 @@ def build_completion_menu(completions: List[Completion],
                          screen_width: int,
                          mode: CompletionMode,
                          cursor_row: int = -1,
-                         cursor_col: int = -1) -> str:
-    """Build the completion menu overlay as escape sequences."""
+                         cursor_col: int = -1) -> Tuple[str, Tuple[int, int, int, int]]:
+    """Build the completion menu overlay as escape sequences.
+
+    Returns:
+        (menu_string, (start_row, start_col, menu_width, menu_height))
+        The coordinates are needed for proper screen restoration.
+    """
     if not completions:
-        return ""
+        return "", (0, 0, 0, 0)
 
     parts: List[str] = ["\0337"]  # Save cursor
 
@@ -505,26 +510,33 @@ def build_completion_menu(completions: List[Completion],
     parts.append("╰" + "─" * (menu_width - 2) + "╯")
 
     parts.append("\033[0m\0338")  # Reset and restore cursor
-    return ''.join(parts)
+    return ''.join(parts), (start_row, start_col, menu_width, menu_height)
 
 
 def build_screen_restore(lines: List[iterm2.screen.LineContents],
-                        screen_height: int,
-                        screen_width: int,
-                        menu_height: int) -> str:
-    """Build sequence to restore screen area under menu."""
+                        menu_pos: Tuple[int, int, int, int]) -> str:
+    """Build sequence to restore screen area under menu.
+
+    Args:
+        lines: Original screen content
+        menu_pos: (start_row, start_col, menu_width, menu_height) from build_completion_menu
+    """
+    start_row, start_col, menu_width, menu_height = menu_pos
     parts: List[str] = ["\0337"]  # Save cursor
 
-    start_row = screen_height - menu_height
-    start_col = screen_width - min(60, screen_width - 4) - 2
-
-    for row in range(start_row, screen_height):
-        if row >= len(lines):
-            break
+    # Restore the exact area where the menu was drawn
+    for row_offset in range(menu_height):
+        row = start_row + row_offset - 1  # start_row is 1-indexed, lines[] is 0-indexed
+        if row < 0 or row >= len(lines):
+            continue
         line = lines[row]
-        parts.append(f"\033[{row + 1};{start_col}H")
 
-        for col in range(start_col - 1, screen_width):
+        # Position cursor at the start of this row's menu area
+        parts.append(f"\033[{start_row + row_offset};{start_col}H")
+
+        # Restore each cell in the menu width
+        for col_offset in range(menu_width):
+            col = start_col + col_offset - 1  # start_col is 1-indexed
             try:
                 cell = line.string_at(col)
                 style = None
@@ -673,6 +685,7 @@ async def complete_interactive(connection, session, mode: CompletionMode):
             filter_text = initial_prefix  # Start with prefix already typed
             selected_idx = 0
             prev_menu_height = 0  # Track for clearing
+            menu_pos = (0, 0, 0, 0)  # Track menu position for restore
 
             # Switch to alternate screen if available
             if use_alt_screen:
@@ -709,7 +722,7 @@ async def complete_interactive(connection, session, mode: CompletionMode):
 
                     if not filtered:
                         # No matches, show empty state
-                        menu = build_completion_menu(
+                        menu, menu_pos = build_completion_menu(
                             [], 0, filter_text, screen_height, screen_width, mode,
                             cursor_row, cursor_col
                         )
@@ -718,7 +731,7 @@ async def complete_interactive(connection, session, mode: CompletionMode):
                         selected_idx = min(selected_idx, len(filtered) - 1)
                         selected_idx = max(0, selected_idx)
 
-                        menu = build_completion_menu(
+                        menu, menu_pos = build_completion_menu(
                             filtered, selected_idx, filter_text,
                             screen_height, screen_width, mode,
                             cursor_row, cursor_col
@@ -771,11 +784,8 @@ async def complete_interactive(connection, session, mode: CompletionMode):
                 if use_alt_screen:
                     await session.async_inject(b'\033[?1049l')
                 else:
-                    # Direct restore for tmux
-                    menu_height = min(len(all_completions) + 5, screen_height - 2)
-                    restore = build_screen_restore(
-                        lines, screen_height, screen_width, menu_height
-                    )
+                    # Direct restore for tmux - use actual menu position
+                    restore = build_screen_restore(lines, menu_pos)
                     await session.async_inject(restore.encode('utf-8'))
 
     # Insert the selected completion OUTSIDE the KeystrokeFilter context
