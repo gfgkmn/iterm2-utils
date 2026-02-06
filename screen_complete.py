@@ -222,7 +222,7 @@ def extract_words(lines: List[iterm2.screen.LineContents],
                   scrollback_text: Optional[List[str]] = None,
                   emacs_content: Optional[str] = None) -> List[Completion]:
     """Extract unique words from screen content, scrollback, and Emacs buffer."""
-    word_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_\-\.]*')
+    word_pattern = re.compile(r'[a-zA-Z_@$~/][a-zA-Z0-9_\-\./:@$~]*')
     seen: Set[str] = set()
     completions: List[Completion] = []
 
@@ -527,12 +527,17 @@ def build_screen_restore(lines: List[iterm2.screen.LineContents],
     # Restore the exact area where the menu was drawn
     for row_offset in range(menu_height):
         row = start_row + row_offset - 1  # start_row is 1-indexed, lines[] is 0-indexed
-        if row < 0 or row >= len(lines):
-            continue
-        line = lines[row]
 
         # Position cursor at the start of this row's menu area
         parts.append(f"\033[{start_row + row_offset};{start_col}H")
+
+        # If row is out of bounds, clear with spaces
+        if row < 0 or row >= len(lines):
+            parts.append("\033[0m")
+            parts.append(" " * menu_width)
+            continue
+
+        line = lines[row]
 
         # Restore each cell in the menu width
         for col_offset in range(menu_width):
@@ -571,7 +576,7 @@ def extract_word_prefix(lines: List[iterm2.screen.LineContents],
     end = min(cursor_col, len(line_text))
     start = end
 
-    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.')
+    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@$~')
 
     while start > 0 and line_text[start - 1] in word_chars:
         start -= 1
@@ -597,6 +602,59 @@ def extract_line_prefix(lines: List[iterm2.screen.LineContents],
     prefix = line_text[:end].lstrip()  # Strip leading whitespace for better matching
 
     debug_print(f"Extracted line prefix: '{prefix}' at ({cursor_row}, 0:{end})")
+    return prefix
+
+
+def find_claude_code_input(lines: List[iterm2.screen.LineContents]) -> Tuple[int, str]:
+    """Find Claude Code's input line and extract the text after '>'.
+
+    Claude Code uses '>' as prompt. The cursor position reported by iTerm2
+    doesn't reflect actual typing position in Ink-based apps.
+
+    Returns:
+        (row, input_text) - row index and the text after '>' prompt
+        (-1, "") if not found
+    """
+    # Search from bottom up for Claude Code prompt pattern
+    # Only match at START of line to avoid false positives from text containing "> "
+    for row in range(len(lines) - 1, -1, -1):
+        line_text = line_to_string(lines[row])
+        stripped = line_text.lstrip()
+
+        # Claude Code prompt patterns (at start of line, possibly with leading whitespace):
+        # "❯" (U+276F) with non-breaking space (\xa0) or regular space - actual Claude Code prompt
+        # "> " - fallback
+        # "› " - alternative prompt character
+        for prompt in ["❯\xa0", "❯ ", "> ", "› "]:
+            if stripped.startswith(prompt):
+                input_text = stripped[len(prompt):].rstrip()
+                debug_print(f"Found Claude Code input at row {row}: '{input_text}'")
+                return row, input_text
+
+    debug_print("No Claude Code input line found")
+    return -1, ""
+
+
+def extract_prefix_from_input(input_text: str) -> str:
+    """Extract the word prefix from the end of input text.
+
+    For input "hello wor", returns "wor"
+    For input "run_qw", returns "run_qw"
+    """
+    if not input_text:
+        return ""
+
+    # Find the last word (prefix being typed)
+    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@$~')
+
+    end = len(input_text)
+    start = end
+
+    while start > 0 and input_text[start - 1] in word_chars:
+        start -= 1
+
+    prefix = input_text[start:end]
+    debug_print(f"Extracted prefix from Claude Code input: '{prefix}'")
     return prefix
 
 
@@ -671,6 +729,20 @@ async def complete_interactive(connection, session, mode: CompletionMode):
             # LINE mode: extract everything from line start to cursor
             initial_prefix = extract_line_prefix(lines, cursor_row, cursor_col)
         debug_print(f"Initial prefix from cursor: '{initial_prefix}'")
+
+    # If no prefix found (e.g., cursor at col 0 in Ink apps like Claude Code),
+    # try to detect Claude Code's input line
+    if not initial_prefix:
+        debug_print("No prefix from cursor, trying Claude Code detection...")
+        cc_row, cc_input = find_claude_code_input(lines)
+        if cc_row >= 0 and cc_input:
+            if mode == CompletionMode.WORD:
+                initial_prefix = extract_prefix_from_input(cc_input)
+            else:
+                # For LINE mode, use the whole input as prefix
+                initial_prefix = cc_input.strip()
+            cursor_row = cc_row  # Update for display purposes
+            debug_print(f"Claude Code prefix: '{initial_prefix}'")
 
     # Track how much to skip when inserting (length of prefix already typed)
     prefix_len = len(initial_prefix)

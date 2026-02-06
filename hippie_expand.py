@@ -254,13 +254,77 @@ def extract_word_prefix(lines: List[iterm2.screen.LineContents],
     end = min(cursor_col, len(line_text))
     start = end
 
-    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.')
+    # Word chars: include path separators, special prefixes for better completion
+    # Include: letters, numbers, _, -, ., /, :, @, $, ~
+    # Split at: =, space, brackets, comma, semicolon, <>, |, &, quotes
+    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@$~')
 
     while start > 0 and line_text[start - 1] in word_chars:
         start -= 1
 
     prefix = line_text[start:end]
     debug_print(f" Extracted prefix: '{prefix}' from position ({cursor_row}, {start}:{end})")
+    return prefix
+
+
+def find_claude_code_input(lines: List[iterm2.screen.LineContents]) -> Tuple[int, str]:
+    """Find Claude Code's input line and extract the text after '>'.
+
+    Claude Code uses '>' as prompt. The cursor position reported by iTerm2
+    doesn't reflect actual typing position in Ink-based apps.
+
+    Returns:
+        (row, input_text) - row index and the text after '>' prompt
+        (-1, "") if not found
+    """
+    # Debug: show last 10 lines to see what's on screen
+    debug_print("Screen content (last 10 lines):")
+    for row in range(max(0, len(lines) - 10), len(lines)):
+        line_text = line_to_string(lines[row])
+        # Show first 80 chars with repr to see special chars
+        debug_print(f"  [{row}]: {repr(line_text[:80])}")
+
+    # Search from bottom up for Claude Code prompt pattern
+    # Only match at START of line to avoid false positives from text containing "> "
+    for row in range(len(lines) - 1, -1, -1):
+        line_text = line_to_string(lines[row])
+        stripped = line_text.lstrip()
+
+        # Claude Code prompt patterns (at start of line, possibly with leading whitespace):
+        # "❯" (U+276F) with non-breaking space (\xa0) or regular space - actual Claude Code prompt
+        # "> " - fallback
+        # "› " - alternative prompt character
+        for prompt in ["❯\xa0", "❯ ", "> ", "› "]:
+            if stripped.startswith(prompt):
+                input_text = stripped[len(prompt):].rstrip()
+                debug_print(f"Found Claude Code input at row {row}: '{input_text}'")
+                return row, input_text
+
+    debug_print("No Claude Code input line found")
+    return -1, ""
+
+
+def extract_prefix_from_input(input_text: str) -> str:
+    """Extract the word prefix from the end of input text.
+
+    For input "hello wor", returns "wor"
+    For input "run_qw", returns "run_qw"
+    """
+    if not input_text:
+        return ""
+
+    # Find the last word (prefix being typed)
+    # Word chars: include path separators, special prefixes for better completion
+    word_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:@$~')
+
+    end = len(input_text)
+    start = end
+
+    while start > 0 and input_text[start - 1] in word_chars:
+        start -= 1
+
+    prefix = input_text[start:end]
+    debug_print(f"Extracted prefix from input: '{prefix}'")
     return prefix
 
 
@@ -273,7 +337,7 @@ def find_word_completions(lines: List[iterm2.screen.LineContents],
     if not prefix:
         return []
 
-    word_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_\-\.]*')
+    word_pattern = re.compile(r'[a-zA-Z_@$~/][a-zA-Z0-9_\-\./:@$~]*')
     prefix_lower = prefix.lower()
 
     # Collect matches with their distance from cursor
@@ -386,6 +450,14 @@ async def hippie_expand(connection, session):
         debug_print("Starting new expansion")
         # New expansion
         prefix = extract_word_prefix(lines, cursor_row, cursor_col)
+
+        # If no prefix found (e.g., cursor at col 0), try Claude Code detection
+        if not prefix:
+            debug_print("No prefix from cursor, trying Claude Code detection...")
+            cc_row, cc_input = find_claude_code_input(lines)
+            if cc_row >= 0 and cc_input:
+                prefix = extract_prefix_from_input(cc_input)
+                cursor_row = cc_row  # Update for distance calculation
 
         if not prefix:
             debug_print("No prefix found")
