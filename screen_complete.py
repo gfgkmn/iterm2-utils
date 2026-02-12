@@ -758,6 +758,7 @@ async def complete_interactive(connection, session, mode: CompletionMode):
             selected_idx = 0
             prev_menu_height = 0  # Track for clearing
             menu_pos = (0, 0, 0, 0)  # Track menu position for restore
+            max_menu_pos = (0, 0, 0, 0)  # Track maximum extent for cleanup
 
             # Switch to alternate screen if available
             if use_alt_screen:
@@ -809,6 +810,17 @@ async def complete_interactive(connection, session, mode: CompletionMode):
                             cursor_row, cursor_col
                         )
 
+                    # Track maximum menu extent for proper cleanup
+                    sr, sc, mw, mh = menu_pos
+                    osr, osc, omw, omh = max_menu_pos
+                    if mw > 0:
+                        max_menu_pos = (
+                            min(sr, osr) if omw > 0 else sr,
+                            min(sc, osc) if omw > 0 else sc,
+                            max(mw, omw),
+                            max(mh, omh),
+                        )
+
                     await session.async_inject(menu.encode('utf-8'))
 
                     # Get keystroke
@@ -856,8 +868,8 @@ async def complete_interactive(connection, session, mode: CompletionMode):
                 if use_alt_screen:
                     await session.async_inject(b'\033[?1049l')
                 else:
-                    # Direct restore for tmux - use actual menu position
-                    restore = build_screen_restore(lines, menu_pos)
+                    # Direct restore for tmux - use max extent to cover all areas the menu occupied
+                    restore = build_screen_restore(lines, max_menu_pos)
                     await session.async_inject(restore.encode('utf-8'))
 
     # Insert the selected completion OUTSIDE the KeystrokeFilter context
