@@ -27,6 +27,9 @@ def detect_session_type(lines):
             r'IPython \d+\.\d+',  # IPython version info
             r'^\s*\.\.\.:',  # IPython continuation prompt
         ],
+        'claude': [
+            r'\[claude\]:',          # Claude Code status line prompt
+        ],
         'bash': [
             r'\$ $',
             r'# $',
@@ -37,10 +40,11 @@ def detect_session_type(lines):
         ]
     }
 
-    # Check last few lines
-    recent_lines = reversed([line.string.strip() for line in lines[-5:]])
+    # Check all lines (reversed) — some indicators like [claude]: status line
+    # may not be in the last few lines
+    all_lines = [line.string.strip() for line in lines]
 
-    for line in recent_lines:
+    for line in reversed(all_lines):
         for session_type, patterns in session_indicators.items():
             for pattern in patterns:
                 if re.search(pattern, line):
@@ -294,13 +298,21 @@ async def get_pane_info(connection, target_session):
         job_args = await target_session.async_get_variable("commandLine")
 
         current_dir = ""
-        for logical_line in reversed(logical_lines):
-            folder_match = re.search(
-                r"(?:^\([^\(]*\))?[^\s:]*:(\/.*?)\s*\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}",
-                logical_line)
-            if folder_match:
-                current_dir = folder_match.group(1)
-                break
+        if session_type == 'claude':
+            for logical_line in reversed(logical_lines):
+                claude_match = re.search(r'\[claude\]:\s*\{[^}]*\}(.*?)\s{2,}', logical_line)
+                if claude_match:
+                    current_dir = claude_match.group(1).strip()
+                    break
+
+        if current_dir == "":
+            for logical_line in reversed(logical_lines):
+                folder_match = re.search(
+                    r"(?:^\([^\(]*\))?[^\s:]*:(\/.*?)\s*\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}",
+                    logical_line)
+                if folder_match:
+                    current_dir = folder_match.group(1)
+                    break
 
         if current_dir == "":
             if current_file:
@@ -382,7 +394,25 @@ async def send_code_to_iterm(code,
             session_info = await get_pane_info(connection, session)
             session_type = session_info.get('session_type', 'unknown')
 
-            if multiline:
+            if session_type == 'claude':
+                if multiline:
+                    # Split into lines, send with Escape+Enter for newlines
+                    lines = code.split('\n')
+                    for i, line in enumerate(lines):
+                        await session.async_send_text(line)
+                        if i < len(lines) - 1:
+                            # Escape then Enter = newline within Claude Code input
+                            await session.async_send_text('\x1b')
+                            await asyncio.sleep(0.05)
+                            await session.async_send_text('\n')
+                            await asyncio.sleep(0.05)
+                    # Final Enter to submit
+                    await session.async_send_text('\n')
+                else:
+                    # Single line — send directly + Enter to submit
+                    await session.async_send_text(code)
+                    await session.async_send_text('\n')
+            elif multiline:
                 # For IPython sessions, use %paste magic command
                 if session_type == 'ipython':
                     # Copy to clipboard first
