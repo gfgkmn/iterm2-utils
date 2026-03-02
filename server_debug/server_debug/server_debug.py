@@ -247,7 +247,7 @@ async def get_all_panes_info(connection):
         pane_info = await get_pane_info(connection, session)
         pane_info["pane_index"] = pane_ind
 
-        if session == active_session:
+        if session.session_id == active_session.session_id:
             results.insert(0, pane_info)
         else:
             results.append(pane_info)
@@ -300,7 +300,9 @@ async def get_pane_info(connection, target_session):
         current_dir = ""
         if session_type == 'claude':
             for logical_line in reversed(logical_lines):
-                claude_match = re.search(r'\[claude\]:\s*\{[^}]*\}(.*?)\s{2,}', logical_line)
+                claude_match = re.search(
+                    r'\[claude\]:\s*(?:\{[^}]*\}\s*)?[^/]*(\/.*?)[\s\x00]+\d{2}/\d{2}/\d{2}[\s\x00]+\d{2}:\d{2}:\d{2}',
+                    logical_line)
                 if claude_match:
                     current_dir = claude_match.group(1).strip()
                     break
