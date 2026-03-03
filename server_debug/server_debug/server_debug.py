@@ -368,14 +368,76 @@ async def get_pane_info(connection, target_session):
     return {}
 
 
+async def send_to_session(connection, session, code, is_ascii, multiline):
+    """Send code to a single iTerm2 session."""
+    if is_ascii:
+        # Send ASCII character
+        ascii_code = ord(code) if len(code) == 1 else int(code)
+        await session.async_send_text(chr(ascii_code))
+    else:
+        # Get session info to determine type
+        session_info = await get_pane_info(connection, session)
+        session_type = session_info.get('session_type', 'unknown')
+
+        if session_type == 'claude':
+            if multiline:
+                # Split into lines, send with Escape+Enter for newlines
+                lines = code.split('\n')
+                for i, line in enumerate(lines):
+                    await session.async_send_text(line)
+                    if i < len(lines) - 1:
+                        # Escape then Enter = newline within Claude Code input
+                        await session.async_send_text('\x1b')
+                        await asyncio.sleep(0.05)
+                        await session.async_send_text('\r')
+                        await asyncio.sleep(0.05)
+                # Final Enter to submit (CR, not LF — Claude Code raw mode expects \r)
+                await session.async_send_text('\r')
+            else:
+                # Single line — send directly + Enter to submit
+                await session.async_send_text(code)
+                await session.async_send_text('\r')
+        elif multiline:
+            # For IPython sessions, use %paste magic command
+            if session_type == 'ipython':
+                # Copy to clipboard first
+                pyperclip.copy(code)
+                # Send %paste command
+                await session.async_send_text('%paste\n')
+                # Small delay to let IPython process the command
+                await asyncio.sleep(0.2)
+            else:
+                # For other sessions (bash, pdb, etc.)
+                pyperclip.copy(code)
+                # Send Ctrl+U to clear line, then paste
+                await session.async_send_text('\x15')  # Ctrl+U
+                await asyncio.sleep(0.1)
+                await session.async_send_text(code)
+                await session.async_send_text('\n')
+        else:
+            # Single line - send directly
+            await session.async_send_text(code)
+            await session.async_send_text('\n')
+
+
 async def send_code_to_iterm(code,
                              connection,
                              target_pane=None,
+                             session_id=None,
                              broadcast=False,
                              is_ascii=False,
                              multiline=False):
     """Enhanced function to send code to iTerm2 with broadcast and targeting support"""
     app = await iterm2.async_get_app(connection)
+
+    if session_id:
+        # Direct session lookup — works across all windows
+        session = app.get_session_by_id(session_id)
+        if session:
+            await send_to_session(connection, session, code, is_ascii, multiline)
+            return True
+        return False
+
     window = app.current_terminal_window
 
     if not window:
@@ -385,63 +447,12 @@ async def send_code_to_iterm(code,
     if not tab:
         return False
 
-    async def send_to_session(session, code, is_ascii, multiline):
-        """Helper function to send code to a single session"""
-        if is_ascii:
-            # Send ASCII character
-            ascii_code = ord(code) if len(code) == 1 else int(code)
-            await session.async_send_text(chr(ascii_code))
-        else:
-            # Get session info to determine type
-            session_info = await get_pane_info(connection, session)
-            session_type = session_info.get('session_type', 'unknown')
-
-            if session_type == 'claude':
-                if multiline:
-                    # Split into lines, send with Escape+Enter for newlines
-                    lines = code.split('\n')
-                    for i, line in enumerate(lines):
-                        await session.async_send_text(line)
-                        if i < len(lines) - 1:
-                            # Escape then Enter = newline within Claude Code input
-                            await session.async_send_text('\x1b')
-                            await asyncio.sleep(0.05)
-                            await session.async_send_text('\n')
-                            await asyncio.sleep(0.05)
-                    # Final Enter to submit
-                    await session.async_send_text('\n')
-                else:
-                    # Single line — send directly + Enter to submit
-                    await session.async_send_text(code)
-                    await session.async_send_text('\n')
-            elif multiline:
-                # For IPython sessions, use %paste magic command
-                if session_type == 'ipython':
-                    # Copy to clipboard first
-                    pyperclip.copy(code)
-                    # Send %paste command
-                    await session.async_send_text('%paste\n')
-                    # Small delay to let IPython process the command
-                    await asyncio.sleep(0.2)
-                else:
-                    # For other sessions (bash, pdb, etc.)
-                    pyperclip.copy(code)
-                    # Send Ctrl+U to clear line, then paste
-                    await session.async_send_text('\x15')  # Ctrl+U
-                    await asyncio.sleep(0.1)
-                    await session.async_send_text(code)
-                    await session.async_send_text('\n')
-            else:
-                # Single line - send directly
-                await session.async_send_text(code)
-                await session.async_send_text('\n')
-
     try:
         if broadcast:
             # Broadcast to all sessions in current tab
             sessions = tab.sessions
             for session in sessions:
-                await send_to_session(session, code, is_ascii, multiline)
+                await send_to_session(connection, session, code, is_ascii, multiline)
         else:
             # Send to specific pane or current session
             if target_pane is not None:
@@ -455,7 +466,7 @@ async def send_code_to_iterm(code,
             else:
                 session = tab.current_session
 
-            await send_to_session(session, code, is_ascii, multiline)
+            await send_to_session(connection, session, code, is_ascii, multiline)
 
         return True
 
@@ -528,6 +539,7 @@ async def handle_send_code(request, connection):
         code = data.get('code', '')
         # print(f"DEBUG: Received code repr: {repr(code)}")  # Add this line
         target_pane = data.get('target_pane')
+        session_id = data.get('session_id')
         broadcast = data.get('broadcast', False)
         is_ascii = data.get('is_ascii', False)
         multiline = data.get('multiline', False)
@@ -535,8 +547,10 @@ async def handle_send_code(request, connection):
         if not code:
             return aiohttp.web.Response(text='No code provided', status=400)
 
-        success = await send_code_to_iterm(code, connection, target_pane, broadcast,
-                                           is_ascii, multiline)
+        success = await send_code_to_iterm(code, connection, target_pane,
+                                           session_id=session_id,
+                                           broadcast=broadcast,
+                                           is_ascii=is_ascii, multiline=multiline)
 
         if success:
             if broadcast:
@@ -579,6 +593,73 @@ async def handle_control(request, connection):
                 return aiohttp.web.Response(text='New pane created successfully')
             else:
                 return aiohttp.web.Response(text='Failed to create new pane', status=500)
+
+        elif action == 'find_window_by_profile':
+            profile_name = data.get('profile')
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            for window in app.windows:
+                for tab in window.tabs:
+                    for session in tab.sessions:
+                        p = await session.async_get_variable("profileName")
+                        if p == profile_name:
+                            tabs_info = []
+                            for t in window.tabs:
+                                sess = t.current_session
+                                tabs_info.append({
+                                    "tab_id": t.tab_id,
+                                    "session_id": sess.session_id if sess else None,
+                                })
+                            return aiohttp.web.json_response({
+                                "window_id": window.window_id,
+                                "tabs": tabs_info,
+                            })
+            return aiohttp.web.json_response({"window_id": None})
+
+        elif action == 'create_tab':
+            profile_name = data.get('profile', 'Emacs Hotkey Window')
+            window_id = data.get('window_id')
+            app = await iterm2.async_get_app(connection)
+            if window_id:
+                window = app.get_window_by_id(window_id)
+                if window:
+                    tab = await window.async_create_tab(profile=profile_name)
+                    session = tab.current_session
+                    return aiohttp.web.json_response({
+                        "session_id": session.session_id,
+                        "tab_id": tab.tab_id,
+                    })
+            # Fallback: create new window with this profile
+            window = await iterm2.Window.async_create(connection, profile=profile_name)
+            tab = window.current_tab
+            session = tab.current_session
+            return aiohttp.web.json_response({
+                "window_id": window.window_id,
+                "session_id": session.session_id,
+                "tab_id": tab.tab_id,
+            })
+
+        elif action == 'activate_tab':
+            session_id = data.get('session_id')
+            app = await iterm2.async_get_app(connection)
+            session = app.get_session_by_id(session_id)
+            if session:
+                window, tab = app.get_window_and_tab_for_session(session)
+                if tab:
+                    await tab.async_activate()
+                    return aiohttp.web.json_response({"status": "ok"})
+            return aiohttp.web.json_response(
+                {"error": "Session not found"}, status=404)
+
+        elif action == 'get_session_info':
+            session_id = data.get('session_id')
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            session = app.get_session_by_id(session_id)
+            if session:
+                info = await get_pane_info(connection, session)
+                return aiohttp.web.json_response(info)
+            return aiohttp.web.json_response({"error": "not_found"})
 
         else:
             return aiohttp.web.Response(text='Unknown action', status=400)
@@ -666,7 +747,7 @@ async def main(connection):
     print("Available endpoints:")
     print("  GET  /breakpoint - Get all pane information")
     print("  POST /send_code  - Send code to panes (supports broadcast and targeting)")
-    print("  POST /control    - Control operations (select_pane, new_pane)")
+    print("  POST /control    - Control operations (select_pane, new_pane, find_window_by_profile, create_tab, activate_tab, get_session_info)")
     print("  GET  /screen_content - Get current pane screen content")
 
     # Keep the server running
