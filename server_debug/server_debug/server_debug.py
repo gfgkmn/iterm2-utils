@@ -126,8 +126,9 @@ def get_hostname_from_config_when_jump(job_args, configs):
     if not configs:
         return None
 
-    # Remove escaped brackets and split the command
+    # Remove escaped brackets, regular brackets, and double quotes
     job_args = job_args.replace('\\[', '').replace('\\]', '')
+    job_args = job_args.replace('[', '').replace(']', '').replace('"', '')
     parts = job_args.split()
 
     # Find the part with the target host (after -W) and jump host (last part)
