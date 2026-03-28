@@ -1,0 +1,1 @@
+/Users/gfgkmn/Library/Application Support/iTerm2/Scripts/assigncolor.py
