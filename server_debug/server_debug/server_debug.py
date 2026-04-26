@@ -28,7 +28,7 @@ def detect_session_type(lines):
             r'^\s*\.\.\.:',  # IPython continuation prompt
         ],
         'claude': [
-            r'\[claude\]:',          # Claude Code status line prompt
+            r'\[claude\]:',  # Claude Code status line prompt
         ],
         'bash': [
             r'\$ $',
@@ -536,8 +536,7 @@ async def create_new_pane(connection):
         current_session = tab.current_session
         if current_session:
             new_session = await current_session.async_split_pane(vertical=True)
-            return {"iterm_session_id": new_session.session_id,
-                    "tab_id": tab.tab_id}
+            return {"iterm_session_id": new_session.session_id, "tab_id": tab.tab_id}
         return False
     except Exception as e:
         print(f"Error creating new pane: {e}")
@@ -562,10 +561,13 @@ async def handle_send_code(request, connection):
         if not code:
             return aiohttp.web.Response(text='No code provided', status=400)
 
-        success = await send_code_to_iterm(code, connection, target_pane,
+        success = await send_code_to_iterm(code,
+                                           connection,
+                                           target_pane,
                                            session_id=session_id,
                                            broadcast=broadcast,
-                                           is_ascii=is_ascii, multiline=multiline)
+                                           is_ascii=is_ascii,
+                                           multiline=multiline)
 
         if success:
             if broadcast:
@@ -673,8 +675,7 @@ async def handle_control(request, connection):
                 if tab:
                     await tab.async_activate()
                     return aiohttp.web.json_response({"status": "ok"})
-            return aiohttp.web.json_response(
-                {"error": "Session not found"}, status=404)
+            return aiohttp.web.json_response({"error": "Session not found"}, status=404)
 
         elif action == 'get_session_info':
             session_id = data.get('session_id')
@@ -815,7 +816,9 @@ async def main(connection):
     print("Available endpoints:")
     print("  GET  /breakpoint - Get all pane information")
     print("  POST /send_code  - Send code to panes (supports broadcast and targeting)")
-    print("  POST /control    - Control operations (select_pane, new_pane, find_window_by_profile, find_active_window, create_tab, activate_tab, get_session_info)")
+    print(
+        "  POST /control    - Control operations (select_pane, new_pane, find_window_by_profile, find_active_window, create_tab, activate_tab, get_session_info)"
+    )
     print("  GET  /screen_content - Get current pane screen content")
 
     # Keep the server running
