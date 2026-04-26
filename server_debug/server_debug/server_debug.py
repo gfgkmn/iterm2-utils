@@ -298,6 +298,15 @@ async def get_pane_info(connection, target_session):
         job_name = await target_session.async_get_variable("jobName")
         job_args = await target_session.async_get_variable("commandLine")
 
+        # Fallback: if screen scrape didn't detect `claude' (e.g. user
+        # scrolled back past the `[claude]:' prompt), but the foreground
+        # process is named `claude' or a common wrapper, treat as claude.
+        # Without this, send_code picks the bash branch and mangles input.
+        if session_type != 'claude' and job_name:
+            jn = job_name.lower()
+            if jn == 'claude' or jn.startswith('claude-') or jn == 'claude-light':
+                session_type = 'claude'
+
         current_dir = ""
         if session_type == 'claude':
             for logical_line in reversed(logical_lines):
@@ -364,6 +373,7 @@ async def get_pane_info(connection, target_session):
             "line": line,
             "current_file": final_mappping(current_file),
             "session_type": session_type,
+            "iterm_session_id": target_session.session_id,
         }
 
     return {}
@@ -381,23 +391,24 @@ async def send_to_session(connection, session, code, is_ascii, multiline):
         session_type = session_info.get('session_type', 'unknown')
 
         if session_type == 'claude':
-            if multiline:
-                # Split into lines, send with Escape+Enter for newlines
-                lines = code.split('\n')
-                for i, line in enumerate(lines):
-                    await session.async_send_text(line)
-                    if i < len(lines) - 1:
-                        # Escape then Enter = newline within Claude Code input
-                        await session.async_send_text('\x1b')
-                        await asyncio.sleep(0.05)
-                        await session.async_send_text('\r')
-                        await asyncio.sleep(0.05)
-                # Final Enter to submit (CR, not LF — Claude Code raw mode expects \r)
-                await session.async_send_text('\r')
-            else:
-                # Single line — send directly + Enter to submit
-                await session.async_send_text(code)
-                await session.async_send_text('\r')
+            # Bracketed paste for ALL claude input (single + multiline).
+            # ESC[200~ … ESC[201~ tells CC's Ink/React input reader
+            # "treat as one atomic paste":
+            #   * Multi-line: embedded \n stay as literal newlines, not
+            #     submissions (replaces the old per-line Esc+Enter dance,
+            #     which broke when the 50 ms gap exceeded CC's escape-
+            #     timeout and split each \n into its own turn).
+            #   * Single-line: prevents partial-byte loss when CC is mid-
+            #     render (atomic paste can't be partially eaten).
+            # The 100 ms sleep before \r lets CC finish processing the
+            # paste before the submission key arrives — without it, \r
+            # sometimes lands while CC is still in a popup/autocomplete
+            # state and the Enter is swallowed (prompt sits in input box).
+            await session.async_send_text('\x1b[200~')
+            await session.async_send_text(code)
+            await session.async_send_text('\x1b[201~')
+            await asyncio.sleep(0.1)
+            await session.async_send_text('\r')
         elif multiline:
             # For IPython sessions, use %paste magic command
             if session_type == 'ipython':
@@ -507,7 +518,10 @@ async def select_pane(connection, pane_number):
 
 
 async def create_new_pane(connection):
-    """Create a new pane in the current tab"""
+    """Create a new pane in the current tab.
+    Returns a dict with the new session's `iterm_session_id` on success,
+    False on failure. Returning the id lets callers (e.g. the bridge
+    spawn flow) follow up with send_code against the new pane."""
     app = await iterm2.async_get_app(connection)
     window = app.current_terminal_window
 
@@ -519,11 +533,11 @@ async def create_new_pane(connection):
         return False
 
     try:
-        # Split current session horizontally to create new pane
         current_session = tab.current_session
         if current_session:
-            await current_session.async_split_pane(vertical=True)
-            return True
+            new_session = await current_session.async_split_pane(vertical=True)
+            return {"iterm_session_id": new_session.session_id,
+                    "tab_id": tab.tab_id}
         return False
     except Exception as e:
         print(f"Error creating new pane: {e}")
@@ -589,8 +603,10 @@ async def handle_control(request, connection):
                                             status=500)
 
         elif action == 'new_pane':
-            success = await create_new_pane(connection)
-            if success:
+            result = await create_new_pane(connection)
+            if isinstance(result, dict):
+                return aiohttp.web.json_response(result)
+            elif result:
                 return aiohttp.web.Response(text='New pane created successfully')
             else:
                 return aiohttp.web.Response(text='Failed to create new pane', status=500)
@@ -616,6 +632,14 @@ async def handle_control(request, connection):
                                 "tabs": tabs_info,
                             })
             return aiohttp.web.json_response({"window_id": None})
+
+        elif action == 'find_active_window':
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            w = app.current_terminal_window
+            return aiohttp.web.json_response({
+                "window_id": w.window_id if w else None,
+            })
 
         elif action == 'create_tab':
             profile_name = data.get('profile', 'Emacs Hotkey Window')
@@ -661,6 +685,49 @@ async def handle_control(request, connection):
                 info = await get_pane_info(connection, session)
                 return aiohttp.web.json_response(info)
             return aiohttp.web.json_response({"error": "not_found"})
+
+        elif action == 'find_claude_sessions':
+            # Walk every iTerm session in every window, return the ones that
+            # are running Claude Code (session_type == 'claude'). For each,
+            # include the same fields /breakpoint returns for that pane
+            # (hostname, current_dir, job_pid) so the bridge can present a
+            # rich picker without a follow-up round-trip per pane.
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            results = []
+            for window in app.windows:
+                for tab in window.tabs:
+                    for session in tab.sessions:
+                        try:
+                            # Previously we pre-filtered on detect_session_type
+                            # (visible lines) and skipped panes whose `[claude]:'
+                            # prompt was scrolled out, dropping them from the
+                            # bridge's enumeration until the user scrolled back.
+                            # get_pane_info already has a jobName fallback that
+                            # catches claude by foreground-process name even when
+                            # the screen scrape fails; delegating to it fixes
+                            # the scrollback-miss bug without duplicating logic.
+                            info = await get_pane_info(connection, session)
+                            if info.get("session_type") != 'claude':
+                                continue
+                            job_pid = await session.async_get_variable("jobPid")
+                            try:
+                                job_pid = int(job_pid) if job_pid else None
+                            except (TypeError, ValueError):
+                                job_pid = None
+                            results.append({
+                                "iterm_session_id": session.session_id,
+                                "iterm_window_id": window.window_id,
+                                "iterm_tab_id": tab.tab_id,
+                                "job_pid": job_pid,
+                                "hostname": info.get("hostname", ""),
+                                "current_dir": info.get("current_dir", ""),
+                                "session_type": info.get("session_type", "claude"),
+                            })
+                        except Exception:
+                            # Skip sessions we can't introspect; don't fail the whole scan.
+                            continue
+            return aiohttp.web.json_response({"sessions": results})
 
         else:
             return aiohttp.web.Response(text='Unknown action', status=400)
@@ -748,7 +815,7 @@ async def main(connection):
     print("Available endpoints:")
     print("  GET  /breakpoint - Get all pane information")
     print("  POST /send_code  - Send code to panes (supports broadcast and targeting)")
-    print("  POST /control    - Control operations (select_pane, new_pane, find_window_by_profile, create_tab, activate_tab, get_session_info)")
+    print("  POST /control    - Control operations (select_pane, new_pane, find_window_by_profile, find_active_window, create_tab, activate_tab, get_session_info)")
     print("  GET  /screen_content - Get current pane screen content")
 
     # Keep the server running
