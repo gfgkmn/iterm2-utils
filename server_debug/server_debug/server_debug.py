@@ -1,14 +1,328 @@
 #!/usr/bin/env python3
 
 import asyncio
+import json
 import os
 import re
+import subprocess
 from functools import partial
+from pathlib import Path
 
 import aiohttp.web
 import iterm2
 import paramiko
 import pyperclip
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Registry-based CC pane detection.
+#
+# Replaces the old screen-scrape-only detect_session_type / cwd
+# extraction.  Ground-truth sources (filesystem + process tree),
+# regex screen-scrape kept as last-resort fallback only.
+#
+#   1. ~/.claude/sessions/<PID>.json  — every running CC writes one
+#      with {pid, sessionId, cwd, ...}.
+#   2. ~/.claude/cc-state/<UUID>.json — bridge statusline writes
+#      {tmux_session, session_name, transcript_path, ...}.
+#   3. ps -ax -o pid,ppid           — full PID tree (one syscall).
+#   4. tmux list-clients / list-panes — for tmux-hosted CC.
+#
+# The detection function itself returns rich data drawn from the
+# registry rather than guessed from screen content.
+
+_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+_CC_STATE_DIR = Path.home() / ".claude" / "cc-state"
+
+
+def _resolve_tmux_binary():
+    """Find the tmux binary at module load time.
+
+    The iTerm-spawned Python doesn't inherit the user's interactive
+    PATH — `/opt/homebrew/bin' (Apple-Silicon Homebrew) and
+    `/usr/local/bin' (Intel Homebrew / typical custom installs) are
+    NOT on PATH for the embedded server, so `subprocess.run([\"tmux\",
+    ...])' fails with FileNotFoundError, gets caught silently, and
+    every tmux-aware code path collapses to a no-op.
+
+    Resolve once: try shutil.which (works if PATH is fine), then
+    common Homebrew locations.  Returns None if tmux isn't found at
+    all (degrades to non-tmux-aware behavior — same as before, but
+    NOW INTENTIONAL rather than silently broken)."""
+    import shutil
+    p = shutil.which("tmux")
+    if p:
+        return p
+    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux",
+                 "/usr/bin/tmux"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+_TMUX_BIN = _resolve_tmux_binary()
+
+
+def _load_sessions_registry():
+    """Return dict pid -> {pid, sessionId, cwd, ...} for every alive
+    CC process.  Skips PIDs whose process no longer exists (stale
+    sessions/<PID>.json files left after a crash)."""
+    reg = {}
+    if not _SESSIONS_DIR.is_dir():
+        return reg
+    for f in _SESSIONS_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+            pid = d.get("pid")
+            if not pid:
+                continue
+            try:
+                os.kill(int(pid), 0)
+            except (ProcessLookupError, PermissionError, ValueError, TypeError):
+                continue
+            reg[int(pid)] = d
+        except Exception:
+            pass
+    return reg
+
+
+def _load_cc_state_by_uuid():
+    """Return dict sessionId -> cc-state dict (tmux_session,
+    session_name, transcript_path, cwd, ...)."""
+    out = {}
+    if not _CC_STATE_DIR.is_dir():
+        return out
+    for f in _CC_STATE_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+            sid = d.get("session_id") or d.get("sessionId")
+            if sid:
+                out[sid] = d
+        except Exception:
+            pass
+    return out
+
+
+def _build_children_map():
+    """Return dict ppid -> [child_pid, ...] from a single
+    `ps -ax -o pid,ppid` syscall.
+
+    macOS NOTE: do NOT use `pgrep -P <ppid>` — without a pattern
+    argument it returns nothing on macOS (different from Linux).
+    `ps` is portable."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-ax", "-o", "pid,ppid"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        return {}
+    children = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def _claude_pid_in_ancestry(start_pid, registry, max_hops=15):
+    """Walk PPIDs upward from start_pid; return first ancestor in
+    registry, or None.  Bounded to avoid runaway traversal."""
+    if not start_pid:
+        return None
+    pid = int(start_pid)
+    for _ in range(max_hops):
+        if pid in registry:
+            return pid
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                text=True, timeout=1, stderr=subprocess.DEVNULL).strip()
+            ppid = int(out) if out else None
+        except Exception:
+            return None
+        if not ppid or ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def _claude_pid_in_descendants(start_pid, registry, children_map,
+                               max_total=80):
+    """BFS down the children tree from start_pid; return first
+    descendant in registry, or None.
+
+    For tmux-pane PIDs: tmux's pane_pid is typically the shell
+    wrapper (bash/zsh); CC is its direct or grandchild descendant.
+    Walk-up doesn't reach it; this walks down."""
+    if not start_pid:
+        return None
+    if start_pid in registry:
+        return start_pid
+    queue = list(children_map.get(start_pid, []))
+    visited = {start_pid}
+    while queue and len(visited) < max_total:
+        pid = queue.pop(0)
+        if pid in visited:
+            continue
+        visited.add(pid)
+        if pid in registry:
+            return pid
+        queue.extend(children_map.get(pid, []))
+    return None
+
+
+def _tmux_clients_by_tty():
+    """Return dict tty -> session_name from `tmux list-clients`.
+    Reflects the CURRENT session each client is attached to —
+    correct after `switch-client', unlike parsing the iTerm pane's
+    job_args (which records only the launch command).
+
+    Returns {} when tmux binary isn't reachable from this server
+    (see `_resolve_tmux_binary')."""
+    if not _TMUX_BIN:
+        return {}
+    try:
+        out = subprocess.check_output(
+            [_TMUX_BIN, "list-clients", "-F",
+             "#{client_tty} #{session_name}"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        return {}
+    m = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2:
+            m[parts[0]] = parts[1]
+    return m
+
+
+def _tmux_pane_pids(session_name):
+    """Return list of pane PIDs in tmux session, or []."""
+    if not session_name or not _TMUX_BIN:
+        return []
+    try:
+        out = subprocess.check_output(
+            [_TMUX_BIN, "list-panes", "-t", session_name,
+             "-F", "#{pane_pid}"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def _parse_tmux_session_from_args(job_args):
+    """Last-resort parse of `tmux ... -t <session>` from job_args.
+    Less reliable than `_tmux_clients_by_tty` because the user may
+    have done `switch-client` since launch."""
+    if not job_args:
+        return None
+    m = re.search(r'-t\s+(\S+)', job_args)
+    if m:
+        return m.group(1).rstrip(';').rstrip(',')
+    return None
+
+
+async def claude_info_for_pane(session, registry=None, by_uuid=None,
+                               children_map=None, tmux_by_tty=None):
+    """Return rich CC info for SESSION, or None if not CC.
+
+    Detection priority (ground-truth → heuristic):
+
+      1. PID-walk UP from session.jobPid: catches CC running directly
+         in the iTerm pane and CC's tool subprocesses (chrome-devtools-mcp,
+         node, bash, etc.).
+      2. tmux-tty lookup: when the pane's tty is attached to a tmux
+         session (per `list-clients`), list its panes' PIDs and walk
+         DOWN to find a CC descendant.
+
+    Returns dict with: session_id, claude_pid, current_dir,
+    session_name, transcript_path, tmux_session, detection_path.
+
+    The cached helper-data args (registry / by_uuid / children_map /
+    tmux_by_tty) are populated at call time when None — pass them in
+    when iterating multiple panes (find_claude_sessions) to avoid
+    repeated filesystem / subprocess work."""
+    if registry is None:
+        registry = _load_sessions_registry()
+    if by_uuid is None:
+        by_uuid = _load_cc_state_by_uuid()
+    if children_map is None:
+        children_map = _build_children_map()
+    if tmux_by_tty is None:
+        tmux_by_tty = _tmux_clients_by_tty()
+
+    try:
+        job_name = await session.async_get_variable("jobName")
+    except Exception:
+        job_name = None
+    try:
+        job_pid_raw = await session.async_get_variable("jobPid")
+    except Exception:
+        job_pid_raw = None
+    try:
+        job_args = await session.async_get_variable("commandLine")
+    except Exception:
+        job_args = None
+    try:
+        tty = await session.async_get_variable("tty")
+    except Exception:
+        tty = None
+    try:
+        job_pid = int(job_pid_raw) if job_pid_raw else None
+    except (TypeError, ValueError):
+        job_pid = None
+
+    def _build_result(cc_pid, detection_path, tmux_name=None):
+        d = registry[cc_pid]
+        sid = d.get("sessionId")
+        ccs = by_uuid.get(sid, {}) if sid else {}
+        return {
+            "session_id": sid,
+            "claude_pid": cc_pid,
+            "current_dir": d.get("cwd") or ccs.get("cwd"),
+            "session_name": ccs.get("session_name"),
+            "transcript_path": ccs.get("transcript_path"),
+            "tmux_session": tmux_name or ccs.get("tmux_session"),
+            "detection_path": detection_path,
+        }
+
+    # Path 1: PID-walk up from jobPid.
+    if job_pid:
+        match_pid = _claude_pid_in_ancestry(job_pid, registry)
+        if match_pid:
+            return _build_result(match_pid, "pid_walk")
+
+    # Path 2: tmux session — prefer list-clients (current attach),
+    # fall back to job_args (launch command).
+    tmux_name = None
+    if tty and tty in tmux_by_tty:
+        tmux_name = tmux_by_tty[tty]
+    elif job_name == "tmux":
+        tmux_name = _parse_tmux_session_from_args(job_args)
+
+    if tmux_name:
+        for pane_pid in _tmux_pane_pids(tmux_name):
+            cc_pid = _claude_pid_in_descendants(
+                pane_pid, registry, children_map)
+            if cc_pid:
+                return _build_result(
+                    cc_pid, f"tmux_lookup({tmux_name})", tmux_name)
+
+    return None
 
 
 def detect_session_type(lines):
@@ -28,7 +342,21 @@ def detect_session_type(lines):
             r'^\s*\.\.\.:',  # IPython continuation prompt
         ],
         'claude': [
-            r'\[claude\]:',  # Claude Code status line prompt
+            # Primary signal: CC's `[claude]:` statusline at bottom
+            # of pane.  Visible during normal idle/streaming render.
+            r'\[claude\]:',
+            # Permission-dialog umbrellas — when CC's TUI shows a
+            # tool-permission prompt the dialog covers the bottom
+            # statusline, so `[claude]:` isn't visible.  Every
+            # permission prompt CC 2.x emits starts with one of these
+            # two phrases (verified against the 2.1.119 binary):
+            #   "Do you want to <action>?"   — proceed, make this
+            #     edit, allow this connection, use this API key,
+            #     allow Claude to fetch, etc.
+            #   "Claude wants to <action>"   — enter/exit plan mode,
+            #     fetch content from this URL, guide you through ...
+            r'Do you want to ',
+            r'Claude wants to ',
         ],
         'bash': [
             r'\$ $',
@@ -270,6 +598,29 @@ async def get_pane_info(connection, target_session):
         session_type = detect_session_type(lines)
         logical_lines = reconstruct_logical_lines(lines)
 
+        # Registry-based CC detection.  Ground-truth from
+        # ~/.claude/sessions/<PID>.json + process tree + tmux state.
+        # When this returns a hit, override session_type and provide
+        # the current_dir from the registry — bypasses the brittle
+        # `[claude]:' / scrollback regex below.
+        cc_info = await claude_info_for_pane(target_session)
+        cc_session_id = None
+        cc_claude_pid = None
+        cc_session_name = None
+        cc_transcript_path = None
+        cc_tmux_session = None
+        cc_detection_path = None
+        cc_current_dir = None
+        if cc_info:
+            session_type = 'claude'
+            cc_session_id = cc_info.get("session_id")
+            cc_claude_pid = cc_info.get("claude_pid")
+            cc_session_name = cc_info.get("session_name")
+            cc_transcript_path = cc_info.get("transcript_path")
+            cc_tmux_session = cc_info.get("tmux_session")
+            cc_detection_path = cc_info.get("detection_path")
+            cc_current_dir = cc_info.get("current_dir")
+
         line = -1
         current_file = ""
         arrow_line = -1
@@ -307,8 +658,14 @@ async def get_pane_info(connection, target_session):
             if jn == 'claude' or jn.startswith('claude-') or jn == 'claude-light':
                 session_type = 'claude'
 
-        current_dir = ""
-        if session_type == 'claude':
+        # Prefer the registry-derived cwd when available (cc-state's
+        # `cwd' field is CC's actual working directory, not whatever
+        # the [claude]: line happens to display right now).  Falls
+        # back to the screen-scrape regex / iTerm `path' var when the
+        # registry didn't find a match — preserves behavior for CC
+        # versions / setups the registry can't see.
+        current_dir = cc_current_dir or ""
+        if session_type == 'claude' and not current_dir:
             for logical_line in reversed(logical_lines):
                 claude_match = re.search(
                     r'\[claude\]:\s*(?:\{[^}]*\}\s*)?[^/]*(\/.*?)[\s\x00]+\d{2}/\d{2}/\d{2}[\s\x00]+\d{2}:\d{2}:\d{2}',
@@ -316,6 +673,17 @@ async def get_pane_info(connection, target_session):
                 if claude_match:
                     current_dir = claude_match.group(1).strip()
                     break
+            # Last-resort: iTerm's `path' var (from OSC 7) when even
+            # the regex misses (e.g., permission dialog covers the
+            # [claude]: statusline AND the registry didn't find a
+            # match — rare).
+            if not current_dir:
+                try:
+                    pv = await target_session.async_get_variable("path")
+                    if pv and isinstance(pv, str):
+                        current_dir = pv.strip()
+                except Exception:
+                    pass
 
         if current_dir == "":
             for logical_line in reversed(logical_lines):
@@ -374,6 +742,15 @@ async def get_pane_info(connection, target_session):
             "current_file": final_mappping(current_file),
             "session_type": session_type,
             "iterm_session_id": target_session.session_id,
+            # Rich CC info from the registry (None when not CC or
+            # when the registry didn't find a match; bridge consumers
+            # treat these as authoritative when present).
+            "session_id": cc_session_id,
+            "claude_pid": cc_claude_pid,
+            "session_name": cc_session_name,
+            "transcript_path": cc_transcript_path,
+            "tmux_session": cc_tmux_session,
+            "cc_detection_path": cc_detection_path,
         }
 
     return {}
@@ -407,7 +784,18 @@ async def send_to_session(connection, session, code, is_ascii, multiline):
             await session.async_send_text('\x1b[200~')
             await session.async_send_text(code)
             await session.async_send_text('\x1b[201~')
-            await asyncio.sleep(0.1)
+            # 300 ms (was 100 ms): the gap covers (a) CC's React re-render
+            # of the input box after `\x1b[201~', and (b) any autocomplete
+            # / slash-menu popup CC opens for `@<path>' or `/<cmd>' in the
+            # pasted content.  When the popup is still resolving when \r
+            # arrives, the popup absorbs it (selects suggestion / dismisses
+            # menu) and the prompt is left sitting in the input box —
+            # exactly the "needs an extra Enter" symptom users report.
+            # 300 ms is a heuristic, not a guarantee; if it still races,
+            # the next step is screen-scrape verify-and-retry, not a
+            # bigger sleep.  Don't try Escape-before-Enter — CC reserves
+            # Escape+Enter for multiline newline insertion.
+            await asyncio.sleep(0.3)
             await session.async_send_text('\r')
         elif multiline:
             # For IPython sessions, use %paste magic command
@@ -673,7 +1061,17 @@ async def handle_control(request, connection):
             if session:
                 window, tab = app.get_window_and_tab_for_session(session)
                 if tab:
+                    # Select the tab within its window.
                     await tab.async_activate()
+                    # Also raise the window itself.  Without this,
+                    # hotkey windows (hidden by default) stayed hidden
+                    # even though `tab.async_activate()` selected the
+                    # right tab inside them — the user saw nothing.
+                    if window:
+                        try:
+                            await window.async_activate()
+                        except Exception:
+                            pass
                     return aiohttp.web.json_response({"status": "ok"})
             return aiohttp.web.json_response({"error": "Session not found"}, status=404)
 
@@ -688,47 +1086,159 @@ async def handle_control(request, connection):
             return aiohttp.web.json_response({"error": "not_found"})
 
         elif action == 'find_claude_sessions':
-            # Walk every iTerm session in every window, return the ones that
-            # are running Claude Code (session_type == 'claude'). For each,
-            # include the same fields /breakpoint returns for that pane
-            # (hostname, current_dir, job_pid) so the bridge can present a
-            # rich picker without a follow-up round-trip per pane.
+            # Walk every iTerm session in every window, return the ones
+            # that are running Claude Code.  Detection uses the registry
+            # (~/.claude/sessions/<PID>.json + process tree + tmux state)
+            # as primary source; falls back to the screen-scrape regex
+            # only for panes the registry can't see (rare).
+            #
+            # Returns rich per-pane info INCLUDING `session_id` from
+            # the registry — bridge consumers (`--build-iterm-uuid-map')
+            # can map uuid → iid directly without re-walking the PID
+            # tree on the elisp side.
             app = await iterm2.async_get_app(connection)
             await app.async_refresh()
+            # Build registry caches ONCE per scan, share across panes
+            # to avoid N redundant filesystem / subprocess passes.
+            registry = _load_sessions_registry()
+            by_uuid = _load_cc_state_by_uuid()
+            children_map = _build_children_map()
+            tmux_by_tty = _tmux_clients_by_tty()
             results = []
             for window in app.windows:
                 for tab in window.tabs:
                     for session in tab.sessions:
                         try:
-                            # Previously we pre-filtered on detect_session_type
-                            # (visible lines) and skipped panes whose `[claude]:'
-                            # prompt was scrolled out, dropping them from the
-                            # bridge's enumeration until the user scrolled back.
-                            # get_pane_info already has a jobName fallback that
-                            # catches claude by foreground-process name even when
-                            # the screen scrape fails; delegating to it fixes
-                            # the scrollback-miss bug without duplicating logic.
-                            info = await get_pane_info(connection, session)
-                            if info.get("session_type") != 'claude':
+                            cc_info = await claude_info_for_pane(
+                                session,
+                                registry=registry,
+                                by_uuid=by_uuid,
+                                children_map=children_map,
+                                tmux_by_tty=tmux_by_tty)
+                            if not cc_info:
+                                # Registry didn't find a CC for this
+                                # pane.  Fall back to the slower
+                                # get_pane_info path which retries via
+                                # the regex screen-scrape — catches
+                                # CC versions / setups where the
+                                # registry isn't authoritative.
+                                info = await get_pane_info(
+                                    connection, session)
+                                if info.get("session_type") != 'claude':
+                                    continue
+                                job_pid_raw = await session.async_get_variable("jobPid")
+                                try:
+                                    job_pid = (int(job_pid_raw)
+                                               if job_pid_raw else None)
+                                except (TypeError, ValueError):
+                                    job_pid = None
+                                results.append({
+                                    "iterm_session_id": session.session_id,
+                                    "iterm_window_id": window.window_id,
+                                    "iterm_tab_id": tab.tab_id,
+                                    "job_pid": job_pid,
+                                    "hostname": info.get("hostname", ""),
+                                    "current_dir": info.get("current_dir", ""),
+                                    "session_type": "claude",
+                                    # Registry didn't match; rich
+                                    # fields are absent so the bridge
+                                    # falls back to its own heuristics.
+                                    "session_id": None,
+                                    "claude_pid": None,
+                                    "session_name": None,
+                                    "transcript_path": None,
+                                    "tmux_session": None,
+                                    "cc_detection_path": "regex_scrape",
+                                })
                                 continue
-                            job_pid = await session.async_get_variable("jobPid")
                             try:
-                                job_pid = int(job_pid) if job_pid else None
-                            except (TypeError, ValueError):
+                                job_name = await session.async_get_variable("jobName")
+                            except Exception:
+                                job_name = None
+                            try:
+                                hostname = await session.async_get_variable("hostname")
+                            except Exception:
+                                hostname = ""
+                            try:
+                                job_pid_raw = await session.async_get_variable("jobPid")
+                                job_pid = (int(job_pid_raw)
+                                           if job_pid_raw else None)
+                            except (TypeError, ValueError, Exception):
                                 job_pid = None
                             results.append({
                                 "iterm_session_id": session.session_id,
                                 "iterm_window_id": window.window_id,
                                 "iterm_tab_id": tab.tab_id,
                                 "job_pid": job_pid,
-                                "hostname": info.get("hostname", ""),
-                                "current_dir": info.get("current_dir", ""),
-                                "session_type": info.get("session_type", "claude"),
+                                "job_name": job_name,
+                                "hostname": hostname or "",
+                                "current_dir": cc_info.get("current_dir") or "",
+                                "session_type": "claude",
+                                # Rich registry-derived fields.
+                                "session_id": cc_info.get("session_id"),
+                                "claude_pid": cc_info.get("claude_pid"),
+                                "session_name": cc_info.get("session_name"),
+                                "transcript_path": cc_info.get("transcript_path"),
+                                "tmux_session": cc_info.get("tmux_session"),
+                                "cc_detection_path": cc_info.get("detection_path"),
                             })
                         except Exception:
                             # Skip sessions we can't introspect; don't fail the whole scan.
                             continue
             return aiohttp.web.json_response({"sessions": results})
+
+        elif action == 'find_active_session':
+            # Return the iterm session_id of the currently-focused pane.
+            # Used by the bridge to decide whether to skip auto-popup
+            # when the user is already looking at the target tab.
+            #
+            # Note: this returns the LAST-active iTerm session when iTerm
+            # itself isn't the frontmost macOS app — the bridge filters
+            # via `(frame-focus-state)' on the elisp side to be sure
+            # iTerm has OS focus before trusting this answer.
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            w = app.current_terminal_window
+            if w and w.current_tab and w.current_tab.current_session:
+                return aiohttp.web.json_response({
+                    "iterm_session_id": w.current_tab.current_session.session_id,
+                    "iterm_window_id": w.window_id,
+                    "iterm_tab_id": w.current_tab.tab_id,
+                })
+            return aiohttp.web.json_response({"iterm_session_id": None})
+
+        elif action == 'find_pane_by_tty':
+            # Reverse-lookup: given a pty path like '/dev/ttys003' (typically
+            # the output of `tmux list-clients -F #{client_tty}`), return the
+            # iTerm session id whose pane is sitting on that tty.
+            #
+            # Used by the bridge's tmux fallback resolver: when CC runs
+            # inside tmux, there's no shared ancestor between the iTerm
+            # pane and the CC process, so the PID-tree-walk in
+            # find_claude_sessions can't bind them.  But every iTerm pane
+            # has a stable `tty' variable, and `tmux list-clients' returns
+            # the tty of every attached client — match them and we know
+            # which iTerm pane is currently showing the tmux session.
+            tty = data.get('tty')
+            if not tty:
+                return aiohttp.web.json_response(
+                    {"error": "missing tty"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            await app.async_refresh()
+            for window in app.windows:
+                for tab in window.tabs:
+                    for session in tab.sessions:
+                        try:
+                            s_tty = await session.async_get_variable("tty")
+                        except Exception:
+                            s_tty = None
+                        if s_tty == tty:
+                            return aiohttp.web.json_response({
+                                "iterm_session_id": session.session_id,
+                                "iterm_window_id": window.window_id,
+                                "iterm_tab_id": tab.tab_id,
+                            })
+            return aiohttp.web.json_response({"iterm_session_id": None})
 
         else:
             return aiohttp.web.Response(text='Unknown action', status=400)
