@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 import re
 import subprocess
 from functools import partial
@@ -66,7 +67,17 @@ _TMUX_BIN = _resolve_tmux_binary()
 def _load_sessions_registry():
     """Return dict pid -> {pid, sessionId, cwd, ...} for every alive
     CC process.  Skips PIDs whose process no longer exists (stale
-    sessions/<PID>.json files left after a crash)."""
+    sessions/<PID>.json files left after a crash).
+
+    Cached for `_CACHE_TTL' seconds — repeat calls within that
+    window reuse the same scan to avoid re-globbing the
+    `~/.claude/sessions/' directory and re-running `os.kill' per
+    PID.  See `_cached_subprocess'."""
+    return _cached_subprocess("_load_sessions_registry",
+                              _load_sessions_registry_uncached)
+
+
+def _load_sessions_registry_uncached():
     reg = {}
     if not _SESSIONS_DIR.is_dir():
         return reg
@@ -88,7 +99,13 @@ def _load_sessions_registry():
 
 def _load_cc_state_by_uuid():
     """Return dict sessionId -> cc-state dict (tmux_session,
-    session_name, transcript_path, cwd, ...)."""
+    session_name, transcript_path, cwd, ...).  Cached for
+    `_CACHE_TTL' seconds."""
+    return _cached_subprocess("_load_cc_state_by_uuid",
+                              _load_cc_state_by_uuid_uncached)
+
+
+def _load_cc_state_by_uuid_uncached():
     out = {}
     if not _CC_STATE_DIR.is_dir():
         return out
@@ -105,11 +122,16 @@ def _load_cc_state_by_uuid():
 
 def _build_children_map():
     """Return dict ppid -> [child_pid, ...] from a single
-    `ps -ax -o pid,ppid` syscall.
+    `ps -ax -o pid,ppid` syscall.  Cached for `_CACHE_TTL' seconds.
 
     macOS NOTE: do NOT use `pgrep -P <ppid>` — without a pattern
     argument it returns nothing on macOS (different from Linux).
     `ps` is portable."""
+    return _cached_subprocess("_build_children_map",
+                              _build_children_map_uncached)
+
+
+def _build_children_map_uncached():
     try:
         out = subprocess.check_output(
             ["ps", "-ax", "-o", "pid,ppid"],
@@ -181,10 +203,16 @@ def _tmux_clients_by_tty():
     """Return dict tty -> session_name from `tmux list-clients`.
     Reflects the CURRENT session each client is attached to —
     correct after `switch-client', unlike parsing the iTerm pane's
-    job_args (which records only the launch command).
+    job_args (which records only the launch command).  Cached for
+    `_CACHE_TTL' seconds.
 
     Returns {} when tmux binary isn't reachable from this server
     (see `_resolve_tmux_binary')."""
+    return _cached_subprocess("_tmux_clients_by_tty",
+                              _tmux_clients_by_tty_uncached)
+
+
+def _tmux_clients_by_tty_uncached():
     if not _TMUX_BIN:
         return {}
     try:
@@ -205,8 +233,17 @@ def _tmux_clients_by_tty():
     return m
 
 
-def _tmux_pane_pids(session_name):
-    """Return list of pane PIDs in tmux session, or []."""
+def _tmux_pane_pids(session_name, panes_by_session=None):
+    """Return list of pane PIDs in tmux session, or [].
+
+    PANES_BY_SESSION is the optional pre-built map from
+    `_tmux_panes_by_session()`.  When provided, this is a pure dict
+    lookup — zero subprocess overhead.  Without it, falls back to a
+    per-call `tmux list-panes -t NAME' subprocess (which the original
+    shape always paid).  Pass it from any caller iterating multiple
+    panes/sessions to collapse N subprocess invocations into 1."""
+    if panes_by_session is not None:
+        return list(panes_by_session.get(session_name, ()))
     if not session_name or not _TMUX_BIN:
         return []
     try:
@@ -224,6 +261,41 @@ def _tmux_pane_pids(session_name):
     return pids
 
 
+def _tmux_panes_by_session():
+    """Return dict session_name -> [pane_pid, ...] from a SINGLE
+    `tmux list-panes -a' call across the entire tmux server.
+
+    Replaces N per-session `_tmux_pane_pids' invocations during a
+    pane scan — with 5 tmux sessions that's 5 subprocess fork/execs
+    collapsed to 1.  Also handles the no-tmux case cleanly (empty
+    dict, no subprocess attempted).  Cached for `_CACHE_TTL' seconds."""
+    return _cached_subprocess("_tmux_panes_by_session",
+                              _tmux_panes_by_session_uncached)
+
+
+def _tmux_panes_by_session_uncached():
+    if not _TMUX_BIN:
+        return {}
+    try:
+        out = subprocess.check_output(
+            [_TMUX_BIN, "list-panes", "-a",
+             "-F", "#{session_name} #{pane_pid}"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL)
+    except Exception:
+        return {}
+    out_map = {}
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        session, pid_s = parts
+        try:
+            out_map.setdefault(session, []).append(int(pid_s))
+        except ValueError:
+            continue
+    return out_map
+
+
 def _parse_tmux_session_from_args(job_args):
     """Last-resort parse of `tmux ... -t <session>` from job_args.
     Less reliable than `_tmux_clients_by_tty` because the user may
@@ -236,8 +308,82 @@ def _parse_tmux_session_from_args(job_args):
     return None
 
 
+_CACHE_TTL = 0.8  # seconds — short enough that newly-spawned CC
+                  # sessions appear in `find_claude_sessions' within
+                  # ~1 s, long enough that consecutive RPCs within the
+                  # same user-flow (dashboard tick + immediate handoff,
+                  # or 2 quick `find_claude_sessions' calls) reuse the
+                  # subprocess work.
+
+_subprocess_cache = {}  # key -> (value, expires_at_monotonic)
+
+
+def _cached_subprocess(key, fn):
+    """Memoize FN()'s result under KEY for `_CACHE_TTL` seconds.
+    Used to elide repeat subprocess fork/execs (`tmux list-clients',
+    `ps -ax', etc.) in back-to-back RPC calls — the within-call
+    sharing is already handled by passing the cache as an arg."""
+    now = time.monotonic()
+    entry = _subprocess_cache.get(key)
+    if entry and entry[1] > now:
+        return entry[0]
+    value = fn()
+    _subprocess_cache[key] = (value, now + _CACHE_TTL)
+    return value
+
+
+_last_app_refresh_at = 0.0
+
+
+async def _throttled_app_refresh(app):
+    """Call `app.async_refresh()` at most once per `_CACHE_TTL` seconds.
+    `async_refresh' re-syncs all iTerm window/tab/session state and
+    can be ~100-200 ms — a noticeable chunk of every action handler.
+    We skip if the previous refresh was recent enough that iTerm's
+    state is still close to ground truth."""
+    global _last_app_refresh_at
+    now = time.monotonic()
+    if now - _last_app_refresh_at < _CACHE_TTL:
+        return
+    await app.async_refresh()
+    _last_app_refresh_at = time.monotonic()
+
+
+async def _async_get_session_vars(session, names):
+    """Read multiple session variables in ONE iTerm RPC.
+
+    `Session.async_get_variable(name)` only sends one variable name
+    per WebSocket round-trip; iTerm's underlying protobuf
+    (`VariableRequest`) accepts a list via the `gets` field.  Calling
+    `iterm2.rpc.async_variable` directly with `gets=names` collapses
+    N round-trips into 1 — the dominant per-pane cost in pane
+    enumeration actions like `find_all_panes` and
+    `find_claude_sessions`.
+
+    Returns dict keyed by NAMES.  Missing/failed reads yield None.
+    """
+    try:
+        response = await iterm2.rpc.async_variable(
+            session.connection,
+            session_id=session.session_id,
+            gets=list(names))
+    except Exception:
+        return {n: None for n in names}
+    if (response.variable_response.status !=
+            iterm2.api_pb2.VariableResponse.Status.Value("OK")):
+        return {n: None for n in names}
+    out = {}
+    for name, raw in zip(names, response.variable_response.values):
+        try:
+            out[name] = json.loads(raw)
+        except Exception:
+            out[name] = None
+    return out
+
+
 async def claude_info_for_pane(session, registry=None, by_uuid=None,
-                               children_map=None, tmux_by_tty=None):
+                               children_map=None, tmux_by_tty=None,
+                               panes_by_session=None):
     """Return rich CC info for SESSION, or None if not CC.
 
     Detection priority (ground-truth → heuristic):
@@ -265,23 +411,19 @@ async def claude_info_for_pane(session, registry=None, by_uuid=None,
     if tmux_by_tty is None:
         tmux_by_tty = _tmux_clients_by_tty()
 
-    # Read all four iTerm variables in parallel via asyncio.gather.
-    # Sequential `await session.async_get_variable(...)` (the previous
-    # shape) costs N WebSocket roundtrips per pane; gather collapses
-    # them to ~1 roundtrip's worth.  With ~8 panes, this is the
-    # dominant win for `find_claude_sessions` latency.
-    # `return_exceptions=True` keeps a single failed read from killing
-    # the whole gather — we coerce exceptions to None below.
-    results = await asyncio.gather(
-        session.async_get_variable("jobName"),
-        session.async_get_variable("jobPid"),
-        session.async_get_variable("commandLine"),
-        session.async_get_variable("tty"),
-        return_exceptions=True)
-    job_name = None if isinstance(results[0], BaseException) else results[0]
-    job_pid_raw = None if isinstance(results[1], BaseException) else results[1]
-    job_args = None if isinstance(results[2], BaseException) else results[2]
-    tty = None if isinstance(results[3], BaseException) else results[3]
+    # Read all four iTerm variables in ONE WebSocket round-trip via
+    # `_async_get_session_vars' (batched `gets' protobuf).  An earlier
+    # iteration used `asyncio.gather' over four separate
+    # `async_get_variable' calls — that marshals concurrency on the
+    # Python side, but iTerm's WebSocket protocol serializes per-session
+    # so the gather barely helped.  Batching collapses the cost to one
+    # actual round-trip per pane.
+    vars_dict = await _async_get_session_vars(
+        session, ["jobName", "jobPid", "commandLine", "tty"])
+    job_name = vars_dict.get("jobName")
+    job_pid_raw = vars_dict.get("jobPid")
+    job_args = vars_dict.get("commandLine")
+    tty = vars_dict.get("tty")
     try:
         job_pid = int(job_pid_raw) if job_pid_raw else None
     except (TypeError, ValueError):
@@ -321,14 +463,30 @@ async def claude_info_for_pane(session, registry=None, by_uuid=None,
         tmux_name = _parse_tmux_session_from_args(job_args)
 
     if tmux_name:
-        for pane_pid in _tmux_pane_pids(tmux_name):
+        for pane_pid in _tmux_pane_pids(tmux_name, panes_by_session):
             cc_pid = _claude_pid_in_descendants(
                 pane_pid, registry, children_map)
             if cc_pid:
                 return _build_result(
                     cc_pid, f"tmux_lookup({tmux_name})", tmux_name)
 
-    return None
+    # No registry detection.  Return a minimal "miss" dict carrying
+    # the per-pane variables we already read — saves the caller from
+    # re-reading them when it decides whether to run the expensive
+    # screen-scrape fallback.  `session_id=None' signals "no CC
+    # detected"; callers should test `cc_info.get("session_id")', not
+    # `if cc_info'.
+    return {
+        "session_id": None,
+        "claude_pid": None,
+        "current_dir": None,
+        "session_name": None,
+        "transcript_path": None,
+        "tmux_session": None,
+        "detection_path": "registry_miss",
+        "job_name": job_name,
+        "job_pid": job_pid,
+    }
 
 
 def detect_session_type(lines):
@@ -605,28 +763,27 @@ async def get_pane_info(connection, target_session):
         logical_lines = reconstruct_logical_lines(lines)
 
         # Registry-based CC detection AND the username/hostname/job
-        # variable reads in parallel.  Both groups are independent
-        # reads against the same iTerm session — no ordering
-        # dependency, so a single `asyncio.gather' collapses ~8
-        # sequential WebSocket round-trips into one round-trip's
-        # worth of latency.  Cuts `get_session_info' from ~170 ms to
-        # ~80 ms; matters for the spawn-completion polling loops in
-        # the bridge (`--wait-for-claude-on-pane',
-        # `--delegate-append-user-after-spawn').
+        # variable reads in parallel.  `claude_info_for_pane' itself
+        # now batches its 4 internal var reads into ONE round-trip via
+        # `_async_get_session_vars'; here we fold the 4 outer var reads
+        # into another single round-trip.  Both halves of the gather
+        # are independent so iTerm can pipeline them.  Net: 1 RPC for
+        # cc_info's vars + 1 RPC for outer vars, instead of 5 separate
+        # `async_get_variable' calls that iTerm serializes server-side.
         gather_results = await asyncio.gather(
             claude_info_for_pane(target_session),
-            target_session.async_get_variable("username"),
-            target_session.async_get_variable("hostname"),
-            target_session.async_get_variable("jobName"),
-            target_session.async_get_variable("commandLine"),
+            _async_get_session_vars(
+                target_session,
+                ["username", "hostname", "jobName", "commandLine"]),
             return_exceptions=True)
         def _ok(v):
             return None if isinstance(v, BaseException) else v
         cc_info = _ok(gather_results[0])
-        username = _ok(gather_results[1])
-        hostname = _ok(gather_results[2])
-        job_name = _ok(gather_results[3])
-        job_args = _ok(gather_results[4])
+        outer_vars = _ok(gather_results[1]) or {}
+        username = outer_vars.get("username")
+        hostname = outer_vars.get("hostname")
+        job_name = outer_vars.get("jobName")
+        job_args = outer_vars.get("commandLine")
 
         cc_session_id = None
         cc_claude_pid = None
@@ -635,7 +792,10 @@ async def get_pane_info(connection, target_session):
         cc_tmux_session = None
         cc_detection_path = None
         cc_current_dir = None
-        if cc_info:
+        # `claude_info_for_pane' now always returns a dict; the
+        # registry-miss case has `session_id=None'.  Test on
+        # `session_id', not on truthiness of the dict.
+        if cc_info and cc_info.get("session_id"):
             session_type = 'claude'
             cc_session_id = cc_info.get("session_id")
             cc_claude_pid = cc_info.get("claude_pid")
@@ -1026,7 +1186,7 @@ async def handle_control(request, connection):
         elif action == 'find_window_by_profile':
             profile_name = data.get('profile')
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             for window in app.windows:
                 for tab in window.tabs:
                     for session in tab.sessions:
@@ -1047,7 +1207,7 @@ async def handle_control(request, connection):
 
         elif action == 'find_active_window':
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             w = app.current_terminal_window
             return aiohttp.web.json_response({
                 "window_id": w.window_id if w else None,
@@ -1112,7 +1272,7 @@ async def handle_control(request, connection):
         elif action == 'get_session_info':
             session_id = data.get('session_id')
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             session = app.get_session_by_id(session_id)
             if session:
                 info = await get_pane_info(connection, session)
@@ -1131,13 +1291,17 @@ async def handle_control(request, connection):
             # can map uuid → iid directly without re-walking the PID
             # tree on the elisp side.
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             # Build registry caches ONCE per scan, share across panes
             # to avoid N redundant filesystem / subprocess passes.
             registry = _load_sessions_registry()
             by_uuid = _load_cc_state_by_uuid()
             children_map = _build_children_map()
             tmux_by_tty = _tmux_clients_by_tty()
+            # ONE `tmux list-panes -a' call instead of N per-session
+            # calls inside `claude_info_for_pane'.  With ~5 tmux sessions
+            # this collapses 5 fork/exec subprocess invocations into 1.
+            panes_by_session = _tmux_panes_by_session()
 
             async def _process_pane(window, tab, session):
                 """Build the per-pane result dict, or None for non-CC panes.
@@ -1154,7 +1318,8 @@ async def handle_control(request, connection):
                             registry=registry,
                             by_uuid=by_uuid,
                             children_map=children_map,
-                            tmux_by_tty=tmux_by_tty),
+                            tmux_by_tty=tmux_by_tty,
+                            panes_by_session=panes_by_session),
                         session.async_get_variable("hostname"),
                         return_exceptions=True)
                     if isinstance(cc_info, BaseException):
@@ -1162,24 +1327,45 @@ async def handle_control(request, connection):
                     hostname = (
                         "" if isinstance(hostname_or_exc, BaseException)
                         else (hostname_or_exc or ""))
-                    if not cc_info:
-                        # Registry didn't find a CC for this pane.  Fall
-                        # back to the slower regex screen-scrape via
-                        # get_pane_info — catches the rare cases where
-                        # registry isn't authoritative.
-                        info = await get_pane_info(connection, session)
-                        if info.get("session_type") != 'claude':
+                    if not cc_info.get("session_id"):
+                        # Registry didn't detect CC.  Gate the expensive
+                        # regex screen-scrape fallback on `job_name' —
+                        # `get_pane_info' costs ~3-4 iTerm round-trips
+                        # (line_info + contents + var batch) per call,
+                        # and the fallback's CC-detection logic only
+                        # accepts panes where job_name is `claude' /
+                        # `claude-*'.  Skipping non-matching shells /
+                        # vim / etc. cuts ~15-20 wasted RPCs per scan.
+                        #
+                        # When the gate passes, log the trigger so we
+                        # can audit if the fallback ever actually
+                        # produces a CC detection (TODO in memory:
+                        # if it never fires, drop the fallback entirely
+                        # — Option Y).
+                        jn = (cc_info.get("job_name") or "").lower()
+                        if (jn != "claude"
+                                and not jn.startswith("claude-")):
                             return None
+                        # Likely-CC pane — run the legacy fallback.
+                        info = await get_pane_info(connection, session)
+                        ok = info.get("session_type") == 'claude'
                         try:
-                            job_pid_raw = await session.async_get_variable("jobPid")
-                            job_pid = int(job_pid_raw) if job_pid_raw else None
-                        except (TypeError, ValueError, Exception):
-                            job_pid = None
+                            with open("/tmp/cc-bridge-iterm-fallback.log",
+                                      "a", encoding="utf-8") as f:
+                                f.write(
+                                    f"{time.strftime('%Y-%m-%dT%H:%M:%S')}  "
+                                    f"iid={session.session_id}  "
+                                    f"job_name={jn!r}  "
+                                    f"regex_detected_claude={ok}\n")
+                        except Exception:
+                            pass
+                        if not ok:
+                            return None
                         return {
                             "iterm_session_id": session.session_id,
                             "iterm_window_id": window.window_id,
                             "iterm_tab_id": tab.tab_id,
-                            "job_pid": job_pid,
+                            "job_pid": cc_info.get("job_pid"),
                             "hostname": info.get("hostname", ""),
                             "current_dir": info.get("current_dir", ""),
                             "session_type": "claude",
@@ -1227,6 +1413,67 @@ async def handle_control(request, connection):
             results = [r for r in pane_results if r is not None]
             return aiohttp.web.json_response({"sessions": results})
 
+        elif action == 'find_all_panes':
+            # Return EVERY iTerm pane (not just the CC ones the way
+            # `find_claude_sessions' does) with the cosmetic fields the
+            # bridge's `claude-code-bridge-activate-go' picker needs.
+            #
+            # Replaces the elisp-side AppleScript pane enumeration —
+            # AppleScript was ~750 ms because each `tty of s' / `name
+            # of s' / `path of s' is a separate Apple Event.  Here:
+            #   * `_async_get_session_vars' batches the per-pane
+            #     variable reads into ONE WebSocket round-trip.
+            #   * `asyncio.gather' across panes runs all panes
+            #     concurrently.
+            # Net: 11 panes typically lands in ~150-300 ms.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+
+            async def _process_any_pane(window, tab, session,
+                                        win_idx, tab_idx, pane_idx):
+                try:
+                    vars_dict, hk_var = await asyncio.gather(
+                        _async_get_session_vars(
+                            session,
+                            ["tty", "name", "jobName", "path"]),
+                        window.async_get_variable("isHotkeyWindow"),
+                        return_exceptions=True)
+                    if isinstance(vars_dict, BaseException):
+                        vars_dict = {}
+                    if isinstance(hk_var, BaseException):
+                        hk_var = "0"
+                    return {
+                        "iterm_session_id": session.session_id,
+                        "iterm_window_id": window.window_id,
+                        "iterm_tab_id": tab.tab_id,
+                        "win": win_idx,
+                        "tab": tab_idx,
+                        "pane": pane_idx,
+                        # iTerm reports phantom hotkey windows AND the
+                        # real one with isHotkeyWindow=1 — caller
+                        # filters all hotkey windows uniformly.
+                        "is_hotkey_window": (
+                            bool(hk_var) and hk_var != "0"),
+                        "tty": vars_dict.get("tty") or "",
+                        "name": vars_dict.get("name") or "",
+                        "job_name": vars_dict.get("jobName") or "",
+                        "current_dir": vars_dict.get("path") or "",
+                    }
+                except Exception:
+                    return None
+
+            tasks = []
+            for wi, window in enumerate(app.windows, start=1):
+                for ti, tab in enumerate(window.tabs, start=1):
+                    for pi, session in enumerate(tab.sessions, start=1):
+                        tasks.append(
+                            _process_any_pane(window, tab, session,
+                                              wi, ti, pi))
+            pane_results = await asyncio.gather(
+                *tasks, return_exceptions=False)
+            panes = [p for p in pane_results if p is not None]
+            return aiohttp.web.json_response({"panes": panes})
+
         elif action == 'find_active_session':
             # Return the iterm session_id of the currently-focused pane.
             # Used by the bridge to decide whether to skip auto-popup
@@ -1237,7 +1484,7 @@ async def handle_control(request, connection):
             # via `(frame-focus-state)' on the elisp side to be sure
             # iTerm has OS focus before trusting this answer.
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             w = app.current_terminal_window
             if w and w.current_tab and w.current_tab.current_session:
                 return aiohttp.web.json_response({
@@ -1264,7 +1511,7 @@ async def handle_control(request, connection):
                 return aiohttp.web.json_response(
                     {"error": "missing tty"}, status=400)
             app = await iterm2.async_get_app(connection)
-            await app.async_refresh()
+            await _throttled_app_refresh(app)
             for window in app.windows:
                 for tab in window.tabs:
                     for session in tab.sessions:
