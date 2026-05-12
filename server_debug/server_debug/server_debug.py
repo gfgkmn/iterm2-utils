@@ -1527,6 +1527,245 @@ async def handle_control(request, connection):
                             })
             return aiohttp.web.json_response({"iterm_session_id": None})
 
+        elif action == 'inspect_active_pane':
+            # Single-call context probe for the iTerm pane currently focused.
+            # Used by the Karabiner / Keyboard Maestro shortcut scripts —
+            # those run in KM's process tree (no `$ITERM_SESSION_ID' /
+            # `$TMUX' inherited from iTerm), so they ask the server what
+            # iTerm is showing right now.
+            #
+            # Returns:
+            #   {"iid": "...",
+            #    "session_type": "claude" | "bash" | "ipython" | ...,
+            #    "tty": "/dev/ttysNNN",
+            #    "tmux_session": "claude-running-foo" or null,
+            #    "is_runner": true/false,           # tmux_session starts with claude-running-
+            #    "project": "foo" or null,
+            #    "cc_session_id": "uuid" or null}
+            #
+            # `project' is derived consistently with the jump actions:
+            #   - if pane is on a `claude-running-<P>' tmux client → P.
+            #   - else if pane runs CC → cc-state's project_dir basename.
+            #   - else null.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            session = app.current_terminal_window
+            if session:
+                session = session.current_tab
+            if session:
+                session = session.current_session
+            if not session:
+                return aiohttp.web.json_response(
+                    {"error": "no active iTerm session"}, status=404)
+            cc_info = await claude_info_for_pane(session)
+            try:
+                tty = await session.async_get_variable("tty")
+            except Exception:
+                tty = None
+            clients = _tmux_clients_by_tty()
+            tmux_session = clients.get(tty) if tty else None
+            is_runner = bool(
+                tmux_session
+                and tmux_session.startswith("claude-running-"))
+            cc_sid = cc_info.get("session_id") if cc_info else None
+            project = None
+            if is_runner:
+                project = tmux_session[len("claude-running-"):]
+            elif cc_sid:
+                ccs = _load_cc_state_by_uuid().get(cc_sid, {})
+                anchor = (ccs.get("project_dir")
+                          or cc_info.get("current_dir") or "")
+                project = (os.path.basename(anchor.rstrip('/'))
+                           or None)
+            return aiohttp.web.json_response({
+                "iid": session.session_id,
+                "session_type": ("claude" if cc_sid
+                                 else (cc_info and "regex_match")
+                                 or "other"),
+                "tty": tty,
+                "tmux_session": tmux_session,
+                "is_runner": is_runner,
+                "project": project,
+                "cc_session_id": cc_sid,
+            })
+
+        elif action == 'jump_to_runner_for_iid':
+            # From a CC terminal pane (identified by IID), jump to its
+            # corresponding `claude-running-<project>' tmux session.
+            #
+            # Project name derived from the CC's cwd basename — same
+            # rule CC documents in ~/.claude/CLAUDE.md:
+            #   "Session name: `claude-running-<project>' where
+            #    `<project>' is the basename of the working directory."
+            #
+            # 3-rule routing (matches Emacs-side `--env-activate'
+            # for tmux entries):
+            #   1. Runner attached in an iTerm pane → activate that pane.
+            #   2. Runner exists detached → create_tab + `tmux attach'.
+            #   3. Runner doesn't exist → return 404 (caller can surface).
+            iid = data.get('iid')
+            if not iid:
+                return aiohttp.web.json_response(
+                    {"error": "missing iid"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            session = app.get_session_by_id(iid)
+            if not session:
+                return aiohttp.web.json_response(
+                    {"error": f"iid not found: {iid}"}, status=404)
+            cc_info = await claude_info_for_pane(session)
+            # Prefer cc-state's `project_dir' over `current_dir' —
+            # `current_dir' drifts as CC navigates into subdirectories
+            # while reading code; `project_dir' is the stable anchor
+            # CC sets at session start.  CC's runner-naming doc says
+            # "basename of the working directory" — runners are
+            # spawned ONCE at session start, so project_dir is the
+            # right notion of "working directory".
+            sid = cc_info.get("session_id") if cc_info else None
+            ccs = (_load_cc_state_by_uuid().get(sid, {})
+                   if sid else {})
+            anchor = (ccs.get("project_dir")
+                      or (cc_info and cc_info.get("current_dir"))
+                      or None)
+            if not anchor:
+                return aiohttp.web.json_response(
+                    {"error": "no project_dir/cwd for that iid"
+                              " (not a CC pane?)"},
+                    status=404)
+            project = os.path.basename(anchor.rstrip('/'))
+            tmux_name = f"claude-running-{project}"
+            if not _TMUX_BIN:
+                return aiohttp.web.json_response(
+                    {"error": "tmux binary not available"}, status=500)
+            # Rule 3: tmux session doesn't exist.
+            try:
+                rc = subprocess.run(
+                    [_TMUX_BIN, "has-session", "-t", tmux_name],
+                    timeout=2, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL).returncode
+            except Exception:
+                rc = -1
+            if rc != 0:
+                return aiohttp.web.json_response(
+                    {"error": f"runner tmux '{tmux_name}' doesn't exist",
+                     "tmux_name": tmux_name}, status=404)
+            # Rule 1: attached?
+            clients = _tmux_clients_by_tty()
+            attached_tty = None
+            for tty, name in clients.items():
+                if name == tmux_name:
+                    attached_tty = tty
+                    break
+            if attached_tty:
+                for window in app.windows:
+                    for tab in window.tabs:
+                        for s in tab.sessions:
+                            try:
+                                s_tty = await s.async_get_variable("tty")
+                            except Exception:
+                                continue
+                            if s_tty == attached_tty:
+                                await tab.async_activate()
+                                try:
+                                    await window.async_activate()
+                                except Exception:
+                                    pass
+                                return aiohttp.web.json_response({
+                                    "status": "activated_existing",
+                                    "iid": s.session_id,
+                                    "tmux_session": tmux_name,
+                                })
+            # Rule 2: spawn new tab and `tmux attach' there.
+            target_window = (app.current_terminal_window or
+                             (app.windows[0] if app.windows else None))
+            if not target_window:
+                return aiohttp.web.json_response(
+                    {"error": "no iTerm window to spawn into"}, status=500)
+            new_tab = await target_window.async_create_tab()
+            new_session = new_tab.current_session
+            # Short delay to let the shell prompt initialize before the
+            # attach command lands.
+            await asyncio.sleep(0.3)
+            await new_session.async_send_text(
+                f"tmux attach -t {tmux_name}\r")
+            await new_tab.async_activate()
+            try:
+                await target_window.async_activate()
+            except Exception:
+                pass
+            return aiohttp.web.json_response({
+                "status": "spawned_and_attached",
+                "iid": new_session.session_id,
+                "tmux_session": tmux_name,
+            })
+
+        elif action == 'jump_to_cc_for_runner':
+            # From a `claude-running-<project>' tmux pane, jump to the
+            # CC terminal pane working on the same project.  When
+            # multiple CC sessions share the project (parallel work),
+            # pick the one whose transcript JSONL was modified most
+            # recently — the "currently active" CC in practice.
+            project = data.get('project')
+            if not project:
+                return aiohttp.web.json_response(
+                    {"error": "missing project"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            registry = _load_sessions_registry()
+            by_uuid = _load_cc_state_by_uuid()
+            children_map = _build_children_map()
+            tmux_by_tty = _tmux_clients_by_tty()
+            panes_by_session = _tmux_panes_by_session()
+            candidates = []
+            for window in app.windows:
+                for tab in window.tabs:
+                    for s in tab.sessions:
+                        try:
+                            cc_info = await claude_info_for_pane(
+                                s, registry=registry, by_uuid=by_uuid,
+                                children_map=children_map,
+                                tmux_by_tty=tmux_by_tty,
+                                panes_by_session=panes_by_session)
+                        except Exception:
+                            cc_info = None
+                        if not (cc_info and cc_info.get("session_id")):
+                            continue
+                        # Match on project_dir (stable) not current_dir
+                        # (drifts).  Same reason as `jump_to_runner_for_iid'.
+                        cc_sid = cc_info.get("session_id")
+                        cc_ccs = by_uuid.get(cc_sid, {}) if cc_sid else {}
+                        cc_anchor = (cc_ccs.get("project_dir")
+                                     or cc_info.get("current_dir") or "")
+                        if (os.path.basename(cc_anchor.rstrip('/'))
+                                != project):
+                            continue
+                        transcript = cc_info.get("transcript_path")
+                        try:
+                            mtime = (os.path.getmtime(transcript)
+                                     if transcript else 0)
+                        except Exception:
+                            mtime = 0
+                        candidates.append(
+                            (mtime, s, tab, window, cc_info))
+            if not candidates:
+                return aiohttp.web.json_response(
+                    {"error": f"no CC pane for project '{project}'"},
+                    status=404)
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            _, sess, tab, win, info = candidates[0]
+            await tab.async_activate()
+            try:
+                await win.async_activate()
+            except Exception:
+                pass
+            return aiohttp.web.json_response({
+                "status": "activated",
+                "iid": sess.session_id,
+                "session_id": info.get("session_id"),
+                "project": project,
+                "candidates": len(candidates),
+            })
+
         else:
             return aiohttp.web.Response(text='Unknown action', status=400)
 
