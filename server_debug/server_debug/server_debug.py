@@ -1527,6 +1527,79 @@ async def handle_control(request, connection):
                             })
             return aiohttp.web.json_response({"iterm_session_id": None})
 
+        elif action == 'find_clean_panes':
+            # Return iTerm panes that are NOT occupied by Claude Code:
+            #   - skip hotkey windows (user reaches via Cmd+9 anyway)
+            #   - skip panes running CC directly (job_name starts with
+            #     'claude')
+            #   - skip panes attached to `cc-*' tmux sessions (CC TUI
+            #     in tmux)
+            #   - skip panes attached to `claude-running-*' tmux
+            #     sessions (CC's cooperation-protocol runner)
+            #
+            # Used by the Hammerspoon "pick clean pane" chooser bound
+            # to a Karabiner shortcut — gives the user a fuzzy picker
+            # over their UNOCCUPIED terminals, separate from
+            # `claude-code-bridge-activate-go' which mixes CC and
+            # non-CC environments.
+            #
+            # Returns enriched per-pane info; Hammerspoon formats the
+            # display strings.  Cheap: same batched-var-read pattern
+            # as `find_all_panes', plus one tmux subprocess.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            tmux_by_tty = _tmux_clients_by_tty()
+
+            async def _process_clean(window, tab, session,
+                                     win_idx, tab_idx, pane_idx):
+                try:
+                    vars_dict, hk_var = await asyncio.gather(
+                        _async_get_session_vars(
+                            session,
+                            ["tty", "name", "jobName", "path"]),
+                        window.async_get_variable("isHotkeyWindow"),
+                        return_exceptions=True)
+                    if isinstance(vars_dict, BaseException):
+                        vars_dict = {}
+                    if isinstance(hk_var, BaseException):
+                        hk_var = "0"
+                    is_hotkey = bool(hk_var) and hk_var != "0"
+                    if is_hotkey:
+                        return None
+                    job_name = (vars_dict.get("jobName") or "").lower()
+                    if job_name == "claude" or job_name.startswith(
+                            "claude-"):
+                        return None
+                    tty = vars_dict.get("tty") or ""
+                    tmux_sess = tmux_by_tty.get(tty)
+                    if tmux_sess and (tmux_sess.startswith("cc-")
+                                       or tmux_sess.startswith(
+                                           "claude-running-")):
+                        return None
+                    return {
+                        "iid": session.session_id,
+                        "win": win_idx,
+                        "tab": tab_idx,
+                        "pane": pane_idx,
+                        "job_name": vars_dict.get("jobName") or "",
+                        "tty": tty,
+                        "tmux_session": tmux_sess,
+                        "cwd": vars_dict.get("path") or "",
+                        "name": vars_dict.get("name") or "",
+                    }
+                except Exception:
+                    return None
+
+            tasks = []
+            for wi, window in enumerate(app.windows, start=1):
+                for ti, tab in enumerate(window.tabs, start=1):
+                    for pi, session in enumerate(tab.sessions, start=1):
+                        tasks.append(_process_clean(window, tab, session,
+                                                    wi, ti, pi))
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            panes = [p for p in results if p is not None]
+            return aiohttp.web.json_response({"panes": panes})
+
         elif action == 'inspect_active_pane':
             # Single-call context probe for the iTerm pane currently focused.
             # Used by the Karabiner / Keyboard Maestro shortcut scripts —
