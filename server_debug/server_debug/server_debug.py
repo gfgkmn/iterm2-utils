@@ -1600,6 +1600,79 @@ async def handle_control(request, connection):
             panes = [p for p in results if p is not None]
             return aiohttp.web.json_response({"panes": panes})
 
+        elif action == 'find_occupied_panes':
+            # Inverse of `find_clean_panes': return ONLY the iTerm
+            # panes occupied by Claude Code in some form:
+            #   - CC TUI directly in the pane (job_name claude/claude-*)
+            #   - CC TUI inside tmux (tty on a `cc-*' client)
+            #   - CC's shared runner tmux (tty on a `claude-running-*'
+            #     client)
+            #
+            # Used by the Hammerspoon "pick occupied pane" chooser
+            # (invoked via URL scheme `hammerspoon://pick-occupied-pane'
+            # from `cc-bridge-jump-to-pair.sh's fallback path when
+            # the active pane is neither a CC terminal nor a runner).
+            #
+            # Returns the same shape as `find_clean_panes', plus a
+            # `kind' field: "cc-terminal" | "runner".  Hotkey
+            # windows excluded.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            tmux_by_tty = _tmux_clients_by_tty()
+
+            async def _process_occupied(window, tab, session,
+                                        win_idx, tab_idx, pane_idx):
+                try:
+                    vars_dict, hk_var = await asyncio.gather(
+                        _async_get_session_vars(
+                            session,
+                            ["tty", "name", "jobName", "path"]),
+                        window.async_get_variable("isHotkeyWindow"),
+                        return_exceptions=True)
+                    if isinstance(vars_dict, BaseException):
+                        vars_dict = {}
+                    if isinstance(hk_var, BaseException):
+                        hk_var = "0"
+                    if bool(hk_var) and hk_var != "0":
+                        return None
+                    job_name = (vars_dict.get("jobName") or "").lower()
+                    tty = vars_dict.get("tty") or ""
+                    tmux_sess = tmux_by_tty.get(tty)
+                    is_cc_direct = (job_name == "claude"
+                                    or job_name.startswith("claude-"))
+                    is_cc_tmux = (tmux_sess
+                                  and tmux_sess.startswith("cc-"))
+                    is_runner = (tmux_sess
+                                 and tmux_sess.startswith(
+                                     "claude-running-"))
+                    if not (is_cc_direct or is_cc_tmux or is_runner):
+                        return None
+                    kind = "runner" if is_runner else "cc-terminal"
+                    return {
+                        "iid": session.session_id,
+                        "win": win_idx,
+                        "tab": tab_idx,
+                        "pane": pane_idx,
+                        "kind": kind,
+                        "job_name": vars_dict.get("jobName") or "",
+                        "tty": tty,
+                        "tmux_session": tmux_sess,
+                        "cwd": vars_dict.get("path") or "",
+                        "name": vars_dict.get("name") or "",
+                    }
+                except Exception:
+                    return None
+
+            tasks = []
+            for wi, window in enumerate(app.windows, start=1):
+                for ti, tab in enumerate(window.tabs, start=1):
+                    for pi, session in enumerate(tab.sessions, start=1):
+                        tasks.append(_process_occupied(
+                            window, tab, session, wi, ti, pi))
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            panes = [p for p in results if p is not None]
+            return aiohttp.web.json_response({"panes": panes})
+
         elif action == 'inspect_pane_options':
             # Scrape a pane for CC's numbered-options prompt.
             #
@@ -1976,8 +2049,74 @@ async def handle_control(request, connection):
                         candidates.append(
                             (mtime, s, tab, window, cc_info))
             if not candidates:
+                # Rule 2: no CC pane is currently SHOWN in any iTerm
+                # tab.  But the CC may still be alive in a detached
+                # `cc-*' tmux session — mirror jump_to_runner_for_iid's
+                # rule 2 and create a tab + `tmux attach' to it.
+                #
+                # We can't get the CC's tmux session from a pane walk
+                # (there's no pane), so look it up from cc-state:
+                # entries whose project_dir basename matches `project'
+                # and whose `tmux_session' is a live tmux session.
+                if _TMUX_BIN:
+                    detached = []   # (mtime, tmux_session)
+                    for sid, ccs in by_uuid.items():
+                        anchor = (ccs.get("project_dir")
+                                  or ccs.get("cwd") or "")
+                        if (os.path.basename(anchor.rstrip('/'))
+                                != project):
+                            continue
+                        tmux_sess = ccs.get("tmux_session")
+                        if not tmux_sess:
+                            continue
+                        try:
+                            rc = subprocess.run(
+                                [_TMUX_BIN, "has-session",
+                                 "-t", tmux_sess],
+                                timeout=2,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode
+                        except Exception:
+                            rc = -1
+                        if rc != 0:
+                            continue
+                        transcript = ccs.get("transcript_path")
+                        try:
+                            mtime = (os.path.getmtime(transcript)
+                                     if transcript else 0)
+                        except Exception:
+                            mtime = 0
+                        detached.append((mtime, tmux_sess))
+                    if detached:
+                        detached.sort(key=lambda x: x[0], reverse=True)
+                        _, tmux_sess = detached[0]
+                        target_window = (
+                            app.current_terminal_window
+                            or (app.windows[0]
+                                if app.windows else None))
+                        if not target_window:
+                            return aiohttp.web.json_response(
+                                {"error": "no iTerm window to "
+                                          "spawn into"}, status=500)
+                        new_tab = await target_window.async_create_tab()
+                        new_session = new_tab.current_session
+                        await asyncio.sleep(0.3)
+                        await new_session.async_send_text(
+                            f"tmux attach -t {tmux_sess}\r")
+                        await new_tab.async_activate()
+                        try:
+                            await target_window.async_activate()
+                        except Exception:
+                            pass
+                        return aiohttp.web.json_response({
+                            "status": "spawned_and_attached",
+                            "iid": new_session.session_id,
+                            "tmux_session": tmux_sess,
+                        })
+                # Rule 3: no pane shown AND no live tmux session.
                 return aiohttp.web.json_response(
-                    {"error": f"no CC pane for project '{project}'"},
+                    {"error": f"no CC pane or tmux session for "
+                              f"project '{project}'"},
                     status=404)
             candidates.sort(key=lambda x: x[0], reverse=True)
             _, sess, tab, win, info = candidates[0]
