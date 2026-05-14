@@ -1669,10 +1669,18 @@ async def handle_control(request, connection):
             # Regex layout:
             #   group 1 = optional cursor marker (`❯' or `>')
             #   group 2 = digit string
-            #   group 3 = the option label (lazy match, trailing
-            #             whitespace stripped by `\s*$')
+            #   group 3 = the option label (must start with a
+            #             non-digit non-whitespace char so we don't
+            #             false-match version strings like `1.0',
+            #             `2.5'; lazy match, trailing whitespace
+            #             stripped by `\s*$')
+            #
+            # Note `\s*' (not `\s+') between the dot and the label —
+            # CC's terminal-width wrap can squeeze out the space at
+            # exactly that position, producing `2.Yes' instead of
+            # `2. Yes'.  We tolerate both forms.
             opt_re = re.compile(
-                r'^\s*([❯>])?\s*(\d+)\.\s+(.+?)\s*$')
+                r'^\s*([❯>])?\s*(\d+)\.\s*([^\d\s].*?)\s*$')
             parsed = []
             for ln in text_lines:
                 m = opt_re.match(ln)
