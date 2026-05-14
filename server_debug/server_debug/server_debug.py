@@ -1695,12 +1695,16 @@ async def handle_control(request, connection):
             #   {"type": "unstructured"}
             #     — no numbered lines found on screen.
             #
-            # The regex is intentionally permissive — bounded-anchor
-            # scanning (require "Do you want to proceed?" + "Esc to
-            # cancel" markers) was tried and produced zero matches in
-            # practice because the anchor wording doesn't always
-            # appear.  False positives on chat text with numbered
-            # lists are an accepted tradeoff.
+            # Parsing uses a BOUNDED-ANCHOR scan (see below): only the
+            # numbered lines bracketed by CC's prompt frame — the
+            # "Do you want to..." question and the "Esc to cancel · …"
+            # footer — count as options.  This rejects numbered chat
+            # prose ("1. ... 2. ...") that a permissive whole-pane
+            # regex would false-match.  (An earlier bounded-scan
+            # attempt "showed nothing" — but that was the iTerm
+            # `async_get_contents' scrape returning empty; tmux
+            # capture-pane returns the real rendered content, so the
+            # anchors are reliably present.)
             iid = data.get('iid')
             tmux_session = data.get('tmux_session')
             if not iid and not tmux_session:
@@ -1739,26 +1743,67 @@ async def handle_control(request, connection):
                         text_lines.append(ln.string)
                     except Exception:
                         text_lines.append("")
-            # Regex layout:
-            #   group 1 = optional cursor marker (`❯' or `>')
-            #   group 2 = digit string
-            #   group 3 = the option label (must start with a
-            #             non-digit non-whitespace char so we don't
-            #             false-match version strings like `1.0',
-            #             `2.5'; lazy match, trailing whitespace
-            #             stripped by `\s*$')
+            # ── Bounded-anchor scan ──────────────────────────────
+            # CC's permission prompt has a stable frame:
             #
-            # Note `\s*' (not `\s+') between the dot and the label —
-            # CC's terminal-width wrap can squeeze out the space at
-            # exactly that position, producing `2.Yes' instead of
-            # `2. Yes'.  We tolerate both forms.
+            #   Do you want to proceed?          ← START anchor
+            #   ❯ 1. Yes                          ← option lines
+            #     2. No
+            #                                     ← (optional blank)
+            #   Esc to cancel · Tab to amend …    ← END anchor
+            #
+            # Find the END anchor bottom-up, walk up to the START
+            # anchor, parse option lines ONLY between them.  Numbered
+            # chat prose lives ABOVE the START anchor → never scanned.
+            # Lines between the anchors that don't match the option
+            # regex (blanks, wrapped option-text continuations) are
+            # skipped — NOT treated as block boundaries — so long
+            # wrapped option labels still parse.
+            #
+            # Option regex groups:
+            #   1 = optional cursor marker (`❯' or `>')
+            #   2 = digit string
+            #   3 = label — must start with a non-digit non-whitespace
+            #       char so version strings (`1.0') don't match.
+            #       `\s*' (not `\s+') after the dot tolerates CC's
+            #       wrap squeezing out the space (`2.Yes').
+            end_re = re.compile(
+                r'(Esc to cancel|Tab to amend|ctrl\+e to explain'
+                r'|Esc to interrupt)')
+            start_re = re.compile(r'Do you want to')
             opt_re = re.compile(
                 r'^\s*([❯>])?\s*(\d+)\.\s*([^\d\s].*?)\s*$')
+
+            # END anchor — bottom-up, last ~25 lines (an active prompt
+            # always renders at the bottom of the pane).
+            end_idx = None
+            scan_lo = max(0, len(text_lines) - 25)
+            for i in range(len(text_lines) - 1, scan_lo - 1, -1):
+                if end_re.search(text_lines[i]):
+                    end_idx = i
+                    break
+            if end_idx is None:
+                return aiohttp.web.json_response(
+                    {"type": "unstructured"})
+
+            # START anchor — walk up from END, within ~20 lines
+            # (CC's prompt block is compact).
+            start_idx = None
+            walk_lo = max(0, end_idx - 20)
+            for i in range(end_idx - 1, walk_lo - 1, -1):
+                if start_re.search(text_lines[i]):
+                    start_idx = i
+                    break
+            if start_idx is None:
+                return aiohttp.web.json_response(
+                    {"type": "unstructured"})
+
+            # Parse option lines strictly between START and END.
             parsed = []
-            for ln in text_lines:
-                m = opt_re.match(ln)
+            for line in text_lines[start_idx + 1:end_idx]:
+                m = opt_re.match(line)
                 if not m:
-                    continue
+                    continue   # blank / wrapped continuation / etc.
                 try:
                     idx = int(m.group(2))
                 except ValueError:
@@ -1769,13 +1814,10 @@ async def handle_control(request, connection):
             if not parsed:
                 return aiohttp.web.json_response(
                     {"type": "unstructured"})
-            # Sort by declared index — robust against weird scroll
-            # states where lines might be re-ordered.
             parsed.sort(key=lambda r: r[1])
             options = [r[2] for r in parsed]
-            # First option carrying the cursor marker wins.
-            # Default 0 (first option) if no marker matched — works
-            # well because CC's prompts open with cursor on option 1.
+            # First option carrying the cursor marker wins; default
+            # 0 (CC's prompts open with the cursor on option 1).
             cursor = next(
                 (i for i, r in enumerate(parsed) if r[0]),
                 0)
