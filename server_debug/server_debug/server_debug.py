@@ -1600,6 +1600,153 @@ async def handle_control(request, connection):
             panes = [p for p in results if p is not None]
             return aiohttp.web.json_response({"panes": panes})
 
+        elif action == 'inspect_pane_options':
+            # Scrape a pane for CC's numbered-options prompt.
+            #
+            # Source preference (in order):
+            #   1. `tmux_session` field — scrape via `tmux capture-pane'.
+            #      Definitive for tmux-hosted CCs because tmux's view
+            #      is the actual rendered output.
+            #   2. `iid` field — scrape via iTerm's `async_get_contents'.
+            #      Fallback for CCs running directly in iTerm without
+            #      tmux.  Empirically less reliable for tmux-hosted
+            #      CCs: iTerm's view can drop the option lines that
+            #      tmux clearly shows (probably an alternate-screen /
+            #      redraw-timing interaction).
+            #
+            # Returns one of:
+            #   {"type": "numbered", "cursor": N, "options": [...]}
+            #     — N is 0-based index of the option CC's cursor is
+            #       sitting on (matched by the leading `❯' or `>'
+            #       glyph).  Defaults to 0 if no marker found.
+            #   {"type": "unstructured"}
+            #     — no numbered lines found on screen.
+            #
+            # The regex is intentionally permissive — bounded-anchor
+            # scanning (require "Do you want to proceed?" + "Esc to
+            # cancel" markers) was tried and produced zero matches in
+            # practice because the anchor wording doesn't always
+            # appear.  False positives on chat text with numbered
+            # lists are an accepted tradeoff.
+            iid = data.get('iid')
+            tmux_session = data.get('tmux_session')
+            if not iid and not tmux_session:
+                return aiohttp.web.json_response(
+                    {"error": "missing iid or tmux_session"}, status=400)
+            text_lines = []
+            if tmux_session and _TMUX_BIN:
+                # Path 1: tmux capture-pane.  `-p' prints to stdout;
+                # default is the visible pane (no scrollback), which
+                # is what we want — CC's prompt renders in the
+                # visible area when active.
+                try:
+                    out = subprocess.check_output(
+                        [_TMUX_BIN, "capture-pane",
+                         "-t", tmux_session, "-p"],
+                        text=True, timeout=2,
+                        stderr=subprocess.DEVNULL)
+                    text_lines = out.splitlines()
+                except Exception:
+                    text_lines = []
+            if not text_lines and iid:
+                # Path 2: iTerm content read (fallback for non-tmux
+                # CCs, or when tmux capture errored).
+                app = await iterm2.async_get_app(connection)
+                await _throttled_app_refresh(app)
+                session = app.get_session_by_id(iid)
+                if not session:
+                    return aiohttp.web.json_response(
+                        {"error": f"iid not found: {iid}"}, status=404)
+                line_info = await session.async_get_line_info()
+                lines = await session.async_get_contents(
+                    first_line=line_info.first_visible_line_number,
+                    number_of_lines=line_info.mutable_area_height)
+                for ln in lines:
+                    try:
+                        text_lines.append(ln.string)
+                    except Exception:
+                        text_lines.append("")
+            # Regex layout:
+            #   group 1 = optional cursor marker (`❯' or `>')
+            #   group 2 = digit string
+            #   group 3 = the option label (lazy match, trailing
+            #             whitespace stripped by `\s*$')
+            opt_re = re.compile(
+                r'^\s*([❯>])?\s*(\d+)\.\s+(.+?)\s*$')
+            parsed = []
+            for ln in text_lines:
+                m = opt_re.match(ln)
+                if not m:
+                    continue
+                try:
+                    idx = int(m.group(2))
+                except ValueError:
+                    continue
+                # Tuple: (has-cursor-marker?, declared-index, label).
+                parsed.append((m.group(1) is not None,
+                               idx, m.group(3)))
+            if not parsed:
+                return aiohttp.web.json_response(
+                    {"type": "unstructured"})
+            # Sort by declared index — robust against weird scroll
+            # states where lines might be re-ordered.
+            parsed.sort(key=lambda r: r[1])
+            options = [r[2] for r in parsed]
+            # First option carrying the cursor marker wins.
+            # Default 0 (first option) if no marker matched — works
+            # well because CC's prompts open with cursor on option 1.
+            cursor = next(
+                (i for i, r in enumerate(parsed) if r[0]),
+                0)
+            return aiohttp.web.json_response({
+                "type": "numbered",
+                "cursor": cursor,
+                "options": options,
+            })
+
+        elif action == 'send_keys_to_iid':
+            # Send a sequence of named keys to an iTerm pane.  Used
+            # by the notify-options banner to position CC's prompt
+            # cursor on the user's chosen option.
+            #
+            # The key-name → ANSI-escape mapping is below.  Phase 1
+            # uses only `down`/`up`; Phase 2 (auto-confirm) would
+            # add `enter` to the tail of the keys list.
+            iid = data.get('iid')
+            keys = data.get('keys') or []
+            if not iid:
+                return aiohttp.web.json_response(
+                    {"error": "missing iid"}, status=400)
+            if not isinstance(keys, list):
+                return aiohttp.web.json_response(
+                    {"error": "keys must be a list"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            session = app.get_session_by_id(iid)
+            if not session:
+                return aiohttp.web.json_response(
+                    {"error": f"iid not found: {iid}"}, status=404)
+            keymap = {
+                "down":  "\x1b[B",
+                "up":    "\x1b[A",
+                "right": "\x1b[C",
+                "left":  "\x1b[D",
+                "enter": "\r",
+                "esc":   "\x1b",
+            }
+            sent = []
+            for k in keys:
+                seq = keymap.get(str(k).lower())
+                if seq is None:
+                    continue   # ignore unknown key names silently
+                try:
+                    await session.async_send_text(seq)
+                    sent.append(k)
+                except Exception:
+                    pass
+            return aiohttp.web.json_response({
+                "status": "ok", "sent": sent,
+            })
+
         elif action == 'inspect_active_pane':
             # Single-call context probe for the iTerm pane currently focused.
             # Used by the Karabiner / Keyboard Maestro shortcut scripts —
