@@ -19,7 +19,7 @@ import pyperclip
 # Registry-based CC pane detection.
 #
 # Replaces the old screen-scrape-only detect_session_type / cwd
-# extraction.  Ground-truth sources (filesystem + process tree),
+# extraction.  Ground-truth sours (filesystem + process tree),
 # regex screen-scrape kept as last-resort fallback only.
 #
 #   1. ~/.claude/sessions/<PID>.json  — every running CC writes one
@@ -1631,6 +1631,182 @@ async def handle_control(request, connection):
             panes = [p for p in results if p is not None]
             return aiohttp.web.json_response({"panes": panes})
 
+        elif action == 'find_running_panes':
+            # Variant of `find_clean_panes' that ALSO surfaces CC's
+            # cooperation runners (`claude-running-*' tmux sessions).
+            #
+            # Used by Hammerspoon `pick-running-pane' chooser AND
+            # Emacs `claude-code-bridge-activate-go' so the two
+            # pickers stay in lockstep.
+            #
+            # Returns three sectioned arrays:
+            #   clean_panes        : non-CC iTerm panes that aren't
+            #                        attached to a `claude-running-*'
+            #                        tmux session.
+            #   runner_panes       : iTerm panes attached to a
+            #                        `claude-running-*' tmux session.
+            #                        Pane's `tmux_session' field
+            #                        carries the runner name.
+            #   unattached_runners : `claude-running-*' tmux sessions
+            #                        NOT currently attached in any
+            #                        iTerm pane covered above.  Entry
+            #                        shape: {tmux_session, cwd}.
+            #
+            # Dedup: a runner attached in an iTerm pane appears ONLY
+            # in `runner_panes' — its name is removed from
+            # `unattached_runners' to avoid duplicate entries in the
+            # picker.
+            #
+            # Excluded from all sections (same as `find_clean_panes'):
+            # CC iTerm panes (via PID-walk on `claude_info_for_pane'),
+            # panes in `cc-*' tmux sessions, and hotkey windows.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            registry = _load_sessions_registry()
+            by_uuid = _load_cc_state_by_uuid()
+            children_map = _build_children_map()
+            tmux_by_tty = _tmux_clients_by_tty()
+            panes_by_session = _tmux_panes_by_session()
+
+            async def _process_running(window, tab, session,
+                                       win_idx, tab_idx, pane_idx):
+                try:
+                    vars_dict, hk_var = await asyncio.gather(
+                        _async_get_session_vars(
+                            session,
+                            ["tty", "name", "jobName", "path"]),
+                        window.async_get_variable("isHotkeyWindow"),
+                        return_exceptions=True)
+                    if isinstance(vars_dict, BaseException):
+                        vars_dict = {}
+                    if isinstance(hk_var, BaseException):
+                        hk_var = "0"
+                    is_hotkey = bool(hk_var) and hk_var != "0"
+                    if is_hotkey:
+                        return None
+                    cc_info = await claude_info_for_pane(
+                        session,
+                        registry=registry, by_uuid=by_uuid,
+                        children_map=children_map,
+                        tmux_by_tty=tmux_by_tty,
+                        panes_by_session=panes_by_session)
+                    if cc_info and cc_info.get("session_id"):
+                        return None
+                    tty = vars_dict.get("tty") or ""
+                    tmux_sess = tmux_by_tty.get(tty)
+                    # Still skip `cc-*' (CC TUI inside tmux that the
+                    # PID walk might miss in a redraw window).  But
+                    # INCLUDE `claude-running-*' — we section them
+                    # below into runner_panes.
+                    if tmux_sess and tmux_sess.startswith("cc-"):
+                        return None
+                    return {
+                        "iid": session.session_id,
+                        "win": win_idx,
+                        "tab": tab_idx,
+                        "pane": pane_idx,
+                        "job_name": vars_dict.get("jobName") or "",
+                        "tty": tty,
+                        "tmux_session": tmux_sess,
+                        "cwd": vars_dict.get("path") or "",
+                        "name": vars_dict.get("name") or "",
+                    }
+                except Exception:
+                    return None
+
+            tasks = []
+            for wi, window in enumerate(app.windows, start=1):
+                for ti, tab in enumerate(window.tabs, start=1):
+                    for pi, session in enumerate(tab.sessions, start=1):
+                        tasks.append(_process_running(window, tab, session,
+                                                     wi, ti, pi))
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+            all_panes = [p for p in results if p is not None]
+            # Section by runner-attachment.
+            clean_panes = []
+            runner_panes = []
+            covered_runners = set()
+            for p in all_panes:
+                ts = p.get("tmux_session")
+                if ts and ts.startswith("claude-running-"):
+                    runner_panes.append(p)
+                    covered_runners.add(ts)
+                else:
+                    clean_panes.append(p)
+            # Enumerate `claude-running-*' tmux sessions; emit those
+            # not yet covered by an attached pane in runner_panes.
+            unattached_runners = []
+            if _TMUX_BIN:
+                try:
+                    out = subprocess.check_output(
+                        [_TMUX_BIN, "list-sessions",
+                         "-F", "#{session_name}"],
+                        text=True, timeout=2,
+                        stderr=subprocess.DEVNULL)
+                    candidate_names = [
+                        ln for ln in out.splitlines()
+                        if ln.startswith("claude-running-")
+                        and ln not in covered_runners]
+                except Exception:
+                    candidate_names = []
+                for name in candidate_names:
+                    try:
+                        cwd = subprocess.check_output(
+                            [_TMUX_BIN, "display-message",
+                             "-p", "-t", name,
+                             "-F", "#{pane_current_path}"],
+                            text=True, timeout=2,
+                            stderr=subprocess.DEVNULL).strip()
+                    except Exception:
+                        cwd = ""
+                    unattached_runners.append({
+                        "tmux_session": name,
+                        "cwd": cwd,
+                    })
+            return aiohttp.web.json_response({
+                "clean_panes": clean_panes,
+                "runner_panes": runner_panes,
+                "unattached_runners": unattached_runners,
+            })
+
+        elif action == 'attach_runner_in_new_tab':
+            # Spawn a new tab in the active iTerm window and
+            # `tmux attach -t NAME' inside it.  Used by Hammerspoon's
+            # pick-running-pane chooser when the user picks an
+            # `unattached_runners' entry.  Elisp `--env-activate' has
+            # equivalent logic locally; this is the HTTP version for
+            # Lua callers.
+            tmux_session = data.get('tmux_session')
+            if not tmux_session:
+                return aiohttp.web.json_response(
+                    {"error": "missing tmux_session"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            target_window = (app.current_terminal_window or
+                             (app.windows[0] if app.windows else None))
+            if not target_window:
+                return aiohttp.web.json_response(
+                    {"error": "no iTerm window to spawn into"},
+                    status=500)
+            new_tab = await target_window.async_create_tab()
+            new_session = new_tab.current_session
+            # Short delay so the shell prompt initializes before the
+            # attach command lands (matches `jump_to_runner_for_iid'
+            # Rule 2 timing).
+            await asyncio.sleep(0.3)
+            await new_session.async_send_text(
+                f"tmux attach -t {tmux_session}\r")
+            await new_tab.async_activate()
+            try:
+                await target_window.async_activate()
+            except Exception:
+                pass
+            return aiohttp.web.json_response({
+                "status": "attached",
+                "iid": new_session.session_id,
+                "tmux_session": tmux_session,
+            })
+
         elif action == 'find_occupied_panes':
             # Inverse of `find_clean_panes': return ONLY the iTerm
             # panes occupied by Claude Code in some form:
@@ -2027,7 +2203,11 @@ async def handle_control(request, connection):
             # for tmux entries):
             #   1. Runner attached in an iTerm pane → activate that pane.
             #   2. Runner exists detached → create_tab + `tmux attach'.
-            #   3. Runner doesn't exist → return 404 (caller can surface).
+            #   3. Runner doesn't exist → CREATE it detached at the
+            #      project root, then fall through to Rule 2.  The
+            #      cooperation runner is a session-scoped tmux; if CC
+            #      later wants to `send-keys' into the same name it
+            #      will find this existing one (no parallel-spawn).
             iid = data.get('iid')
             if not iid:
                 return aiohttp.web.json_response(
@@ -2062,7 +2242,10 @@ async def handle_control(request, connection):
             if not _TMUX_BIN:
                 return aiohttp.web.json_response(
                     {"error": "tmux binary not available"}, status=500)
-            # Rule 3: tmux session doesn't exist.
+            # Rule 3: tmux session doesn't exist → CREATE it detached
+            # at the project root, then fall through.  After creation,
+            # Rule 1 won't match (nothing attached yet) and Rule 2
+            # spawns the iTerm tab + `tmux attach' as usual.
             try:
                 rc = subprocess.run(
                     [_TMUX_BIN, "has-session", "-t", tmux_name],
@@ -2070,10 +2253,24 @@ async def handle_control(request, connection):
                     stderr=subprocess.DEVNULL).returncode
             except Exception:
                 rc = -1
+            created_runner = False
             if rc != 0:
-                return aiohttp.web.json_response(
-                    {"error": f"runner tmux '{tmux_name}' doesn't exist",
-                     "tmux_name": tmux_name}, status=404)
+                try:
+                    create_rc = subprocess.run(
+                        [_TMUX_BIN, "new-session", "-d",
+                         "-s", tmux_name, "-c", anchor],
+                        timeout=3, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE).returncode
+                except Exception as e:
+                    return aiohttp.web.json_response(
+                        {"error": f"tmux new-session failed for "
+                                  f"'{tmux_name}': {e}"}, status=500)
+                if create_rc != 0:
+                    return aiohttp.web.json_response(
+                        {"error": f"tmux new-session returned "
+                                  f"{create_rc} for '{tmux_name}'"},
+                        status=500)
+                created_runner = True
             # Rule 1: attached?
             clients = _tmux_clients_by_tty()
             attached_tty = None
@@ -2119,7 +2316,8 @@ async def handle_control(request, connection):
             except Exception:
                 pass
             return aiohttp.web.json_response({
-                "status": "spawned_and_attached",
+                "status": ("created_and_attached" if created_runner
+                           else "spawned_and_attached"),
                 "iid": new_session.session_id,
                 "tmux_session": tmux_name,
             })
