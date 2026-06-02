@@ -1530,12 +1530,15 @@ async def handle_control(request, connection):
         elif action == 'find_clean_panes':
             # Return iTerm panes that are NOT occupied by Claude Code:
             #   - skip hotkey windows (user reaches via Cmd+9 anyway)
-            #   - skip panes running CC directly (job_name starts with
-            #     'claude')
-            #   - skip panes attached to `cc-*' tmux sessions (CC TUI
-            #     in tmux)
-            #   - skip panes attached to `claude-running-*' tmux
-            #     sessions (CC's cooperation-protocol runner)
+            #   - skip any pane whose process tree contains CC (uses
+            #     `claude_info_for_pane' — PID-walks the ancestry
+            #     against `~/.claude/sessions/<PID>.json' and walks
+            #     tmux pane PIDs).  Catches CC running directly in
+            #     iTerm (where jobName presents as `node' rather than
+            #     `claude' — the previous job_name-prefix filter
+            #     missed this), CC TUI inside tmux (cc-*), and CC's
+            #     cooperation runner (claude-running-*).  Same
+            #     detection `find_claude_sessions' uses.
             #
             # Used by the Hammerspoon "pick clean pane" chooser bound
             # to a Karabiner shortcut — gives the user a fuzzy picker
@@ -1544,11 +1547,17 @@ async def handle_control(request, connection):
             # non-CC environments.
             #
             # Returns enriched per-pane info; Hammerspoon formats the
-            # display strings.  Cheap: same batched-var-read pattern
-            # as `find_all_panes', plus one tmux subprocess.
+            # display strings.
             app = await iterm2.async_get_app(connection)
             await _throttled_app_refresh(app)
+            # Build CC-detection caches ONCE for this scan, share
+            # across all panes — same pattern `find_claude_sessions'
+            # uses to avoid per-pane filesystem / subprocess work.
+            registry = _load_sessions_registry()
+            by_uuid = _load_cc_state_by_uuid()
+            children_map = _build_children_map()
             tmux_by_tty = _tmux_clients_by_tty()
+            panes_by_session = _tmux_panes_by_session()
 
             async def _process_clean(window, tab, session,
                                      win_idx, tab_idx, pane_idx):
@@ -1566,15 +1575,37 @@ async def handle_control(request, connection):
                     is_hotkey = bool(hk_var) and hk_var != "0"
                     if is_hotkey:
                         return None
-                    job_name = (vars_dict.get("jobName") or "").lower()
-                    if job_name == "claude" or job_name.startswith(
-                            "claude-"):
+                    # Robust CC detection: walks PID ancestry of
+                    # jobPid AND tmux pane PIDs against the sessions
+                    # registry.  NOTE: `claude_info_for_pane' ALWAYS
+                    # returns a dict — `session_id=None' in the dict
+                    # signals "no CC detected" (the comment at the
+                    # function's return site is explicit about this).
+                    # Test the inner field, not the dict itself.
+                    cc_info = await claude_info_for_pane(
+                        session,
+                        registry=registry, by_uuid=by_uuid,
+                        children_map=children_map,
+                        tmux_by_tty=tmux_by_tty,
+                        panes_by_session=panes_by_session)
+                    if cc_info and cc_info.get("session_id"):
                         return None
                     tty = vars_dict.get("tty") or ""
                     tmux_sess = tmux_by_tty.get(tty)
+                    # Ecosystem tmux-name exclusion (kept from the
+                    # old logic): `claude-running-*' runner sessions
+                    # often contain NO live CC process — just user
+                    # shells running cooperative commands — so the
+                    # PID walk above wouldn't catch them.  But they
+                    # are part of the CC workflow and shouldn't
+                    # surface in the clean-pane chooser.  Same for
+                    # `cc-*' which the PID walk does catch when CC
+                    # is live, but we keep the explicit check as a
+                    # backstop for the brief window when CC has just
+                    # exited inside the tmux session.
                     if tmux_sess and (tmux_sess.startswith("cc-")
-                                       or tmux_sess.startswith(
-                                           "claude-running-")):
+                                      or tmux_sess.startswith(
+                                          "claude-running-")):
                         return None
                     return {
                         "iid": session.session_id,
@@ -1711,6 +1742,10 @@ async def handle_control(request, connection):
                 return aiohttp.web.json_response(
                     {"error": "missing iid or tmux_session"}, status=400)
             text_lines = []
+            # DIAG: track which scrape path produced text_lines so the
+            # `unstructured' diagnostic dump (below) can scope itself to
+            # the iTerm path (where the false-negative is being hunted).
+            source = None
             if tmux_session and _TMUX_BIN:
                 # Path 1: tmux capture-pane.  `-p' prints to stdout;
                 # default is the visible pane (no scrollback), which
@@ -1723,11 +1758,13 @@ async def handle_control(request, connection):
                         text=True, timeout=2,
                         stderr=subprocess.DEVNULL)
                     text_lines = out.splitlines()
+                    source = "tmux"
                 except Exception:
                     text_lines = []
             if not text_lines and iid:
                 # Path 2: iTerm content read (fallback for non-tmux
                 # CCs, or when tmux capture errored).
+                source = "iterm"
                 app = await iterm2.async_get_app(connection)
                 await _throttled_app_refresh(app)
                 session = app.get_session_by_id(iid)
@@ -1743,6 +1780,15 @@ async def handle_control(request, connection):
                         text_lines.append(ln.string)
                     except Exception:
                         text_lines.append("")
+                # Normalize NUL bytes to spaces — iTerm's grid model
+                # uses `\x00' for cells that were touched but never had
+                # a real character painted (e.g., the residual left
+                # border of CC's permission-prompt box after redraw).
+                # Python's `\s' doesn't match NUL, so leading-NUL lines
+                # break the option regex's whitespace-eat step and
+                # silently drop options (root cause of the 2-of-3
+                # option capture bug).  Idempotent on clean lines.
+                text_lines = [ln.replace('\x00', ' ') for ln in text_lines]
             # ── Bounded-anchor scan ──────────────────────────────
             # CC's permission prompt has a stable frame:
             #
@@ -1774,6 +1820,35 @@ async def handle_control(request, connection):
             opt_re = re.compile(
                 r'^\s*([❯>])?\s*(\d+)\.\s*([^\d\s].*?)\s*$')
 
+            # DIAG: temporary instrumentation for native-iTerm scrapes
+            # that come back `unstructured' even when a permission
+            # prompt is visibly on screen.  Appends the raw scraped
+            # lines to /tmp/cc-bridge-inspect-pane.log so we can see
+            # exactly what `async_get_contents' is producing.  Scoped
+            # to the iTerm path only — tmux scrapes returning
+            # unstructured are normal (CC idle at empty prompt) and
+            # would just pollute the log.
+            def _log_unstructured(reason):
+                if source != "iterm":
+                    return
+                try:
+                    import datetime as _dt
+                    ts = _dt.datetime.now().isoformat(timespec='milliseconds')
+                    log_path = "/tmp/cc-bridge-inspect-pane.log"
+                    body = [
+                        f"\n==== {ts}  iid={iid}  "
+                        f"tmux_session={tmux_session}  "
+                        f"source={source}  reason={reason}  "
+                        f"line_count={len(text_lines)} ====",
+                    ]
+                    for _idx, _ln in enumerate(text_lines):
+                        body.append(f"[{_idx:03d}] {_ln}")
+                    body.append("")
+                    with open(log_path, "a") as fh:
+                        fh.write("\n".join(body))
+                except Exception:
+                    pass
+
             # END anchor — bottom-up, last ~25 lines (an active prompt
             # always renders at the bottom of the pane).
             end_idx = None
@@ -1783,6 +1858,7 @@ async def handle_control(request, connection):
                     end_idx = i
                     break
             if end_idx is None:
+                _log_unstructured("no_end_anchor")
                 return aiohttp.web.json_response(
                     {"type": "unstructured"})
 
@@ -1795,6 +1871,7 @@ async def handle_control(request, connection):
                     start_idx = i
                     break
             if start_idx is None:
+                _log_unstructured("no_start_anchor")
                 return aiohttp.web.json_response(
                     {"type": "unstructured"})
 
@@ -1812,6 +1889,7 @@ async def handle_control(request, connection):
                 parsed.append((m.group(1) is not None,
                                idx, m.group(3)))
             if not parsed:
+                _log_unstructured("options_empty")
                 return aiohttp.web.json_response(
                     {"type": "unstructured"})
             parsed.sort(key=lambda r: r[1])
@@ -1821,6 +1899,10 @@ async def handle_control(request, connection):
             cursor = next(
                 (i for i, r in enumerate(parsed) if r[0]),
                 0)
+            # DIAG: log numbered returns from the iTerm path too — lets
+            # us compare a first-scrape (mid-render) result against the
+            # 500ms verify-stabilize result and confirm the race fix.
+            _log_unstructured(f"numbered:{len(options)}")
             return aiohttp.web.json_response({
                 "type": "numbered",
                 "cursor": cursor,
