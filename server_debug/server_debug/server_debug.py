@@ -199,6 +199,128 @@ def _claude_pid_in_descendants(start_pid, registry, children_map,
     return None
 
 
+# SSH target → hostname helpers.  Used by `get_pane_info' to surface
+# the EFFECTIVE remote machine when the user is in an SSH session
+# inside tmux (where iTerm's shell-integration `hostname' variable
+# stays frozen at the LOCAL machine because the OSC escapes don't
+# reach iTerm through the remote shell).  Walks the process tree
+# under the pane's jobPid (or tmux pane PIDs when applicable),
+# finds the deepest `ssh' process, parses its argv → host.
+
+# ssh(1) flags that take an argument (next-token or inline `-Xvalue').
+# Used by `_ssh_target_from_argv' to skip past flag values when
+# searching for the host token.
+_SSH_FLAGS_WITH_ARG = set("BbcDEeFIiJLlmOopQRSWw")
+
+
+def _ssh_target_from_argv(cmdline):
+    """Extract the target HOST from an `ssh ...' command line.
+
+    Handles common forms:
+      ssh HOST                                → HOST
+      ssh -i ~/key -p 2222 HOST cmd args      → HOST
+      ssh USER@HOST                           → HOST
+      ssh -tA HOST                            → HOST
+      ssh -- HOST                             → HOST
+
+    Skips flag args (and their inline / next-token values) per the
+    `ssh(1)' option list.  Strips `USER@' prefix.  Returns None
+    when the argv doesn't start with `ssh' or no host is found."""
+    if not cmdline:
+        return None
+    argv = cmdline.split()
+    if not argv or os.path.basename(argv[0]) != "ssh":
+        return None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            i += 1
+            continue
+        if not a.startswith("-"):
+            host = a
+            if "@" in host:
+                host = host.rsplit("@", 1)[1]
+            return host
+        # `-Xvalue' (inline value) — consume just this token.
+        if len(a) > 2 and a[1] in _SSH_FLAGS_WITH_ARG:
+            i += 1
+            continue
+        # `-X value' — consume both tokens.
+        if len(a) == 2 and a[1] in _SSH_FLAGS_WITH_ARG:
+            i += 2
+            continue
+        # No-arg flag (single or combined like `-tA') — consume one.
+        i += 1
+    return None
+
+
+def _build_args_map():
+    """Return cached `{pid: args_string}' from one `ps' call.
+
+    Wrapped via `_cached_subprocess' so multiple `get_pane_info'
+    invocations within one `/breakpoint' request reuse a single
+    `ps' scan instead of N forks."""
+    return _cached_subprocess("_build_args_map", _build_args_map_uncached)
+
+
+def _build_args_map_uncached():
+    try:
+        out = subprocess.check_output(
+            ["ps", "axww", "-o", "pid=,args="],
+            text=True, timeout=2, stderr=subprocess.DEVNULL)
+        result = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            result[pid] = parts[1]
+        return result
+    except Exception:
+        return {}
+
+
+def _deepest_ssh_target_under(start_pid, children_map, args_map,
+                              max_total=80):
+    """BFS down from START_PID; return SSH target of the DEEPEST
+    `ssh' descendant in the process tree, or None.
+
+    Walking pattern mirrors `_claude_pid_in_descendants' — bounded
+    BFS, visited-set guard.  Args are looked up in the precomputed
+    ARGS_MAP (single `ps' for the whole tree) instead of forking
+    `ps' per candidate.
+
+    Deepest wins so nested SSH (e.g. user did `ssh A' then `ssh B'
+    inside) surfaces the innermost target, which is the machine
+    the user's prompt is on right now."""
+    if not start_pid:
+        return None
+    queue = [(start_pid, 0)]
+    visited = {start_pid}
+    deepest = None     # (depth, host)
+    while queue and len(visited) < max_total:
+        pid, depth = queue.pop(0)
+        args = args_map.get(pid)
+        if args:
+            argv0 = args.split(None, 1)[0]
+            if os.path.basename(argv0) == "ssh":
+                host = _ssh_target_from_argv(args)
+                if host and (deepest is None or depth > deepest[0]):
+                    deepest = (depth, host)
+        for child in children_map.get(pid, []):
+            if child not in visited:
+                visited.add(child)
+                queue.append((child, depth + 1))
+    return deepest[1] if deepest else None
+
+
 def _tmux_clients_by_tty():
     """Return dict tty -> session_name from `tmux list-clients`.
     Reflects the CURRENT session each client is attached to —
@@ -774,7 +896,8 @@ async def get_pane_info(connection, target_session):
             claude_info_for_pane(target_session),
             _async_get_session_vars(
                 target_session,
-                ["username", "hostname", "jobName", "commandLine"]),
+                ["username", "hostname", "jobName", "jobPid",
+                 "commandLine", "tty"]),
             return_exceptions=True)
         def _ok(v):
             return None if isinstance(v, BaseException) else v
@@ -782,6 +905,49 @@ async def get_pane_info(connection, target_session):
         outer_vars = _ok(gather_results[1]) or {}
         username = outer_vars.get("username")
         hostname = outer_vars.get("hostname")
+        # SSH-target override: when a descendant `ssh' process
+        # exists in this pane's tree, surface its target as
+        # `hostname'.  Covers the tmux+SSH layering case where
+        # iTerm's `hostname' variable stays frozen at the LOCAL
+        # machine (shell-integration OSC escapes don't reach iTerm
+        # from inside the remote shell).  When the user quits the
+        # SSH, no descendant matches → `hostname' falls back to
+        # iTerm's shell-integration value (correct local), so the
+        # override is purely additive.
+        #
+        # Two probe paths:
+        #   (a) walk `jobPid' children — catches `ssh ...' run
+        #       directly in the iTerm pane.
+        #   (b) walk tmux pane PIDs — catches `ssh' inside a
+        #       tmux-attached session, where jobPid is the tmux
+        #       CLIENT and pane processes live under the tmux
+        #       SERVER (NOT reachable from the client's children).
+        try:
+            job_pid_raw = outer_vars.get("jobPid")
+            tty_var = outer_vars.get("tty")
+            job_pid_int = (int(job_pid_raw)
+                           if job_pid_raw else None)
+            ssh_target = None
+            children_map = _build_children_map()
+            args_map = _build_args_map()
+            if job_pid_int:
+                ssh_target = _deepest_ssh_target_under(
+                    job_pid_int, children_map, args_map)
+            if not ssh_target and tty_var:
+                tmux_by_tty = _tmux_clients_by_tty()
+                tmux_name = tmux_by_tty.get(tty_var)
+                if tmux_name:
+                    panes_by_session = _tmux_panes_by_session()
+                    for pane_pid in _tmux_pane_pids(
+                            tmux_name, panes_by_session):
+                        ssh_target = _deepest_ssh_target_under(
+                            pane_pid, children_map, args_map)
+                        if ssh_target:
+                            break
+            if ssh_target:
+                hostname = ssh_target
+        except Exception:
+            pass
         job_name = outer_vars.get("jobName")
         job_args = outer_vars.get("commandLine")
 
@@ -1981,44 +2147,39 @@ async def handle_control(request, connection):
                 # option capture bug).  Idempotent on clean lines.
                 text_lines = [ln.replace('\x00', ' ') for ln in text_lines]
             # ── Bounded-anchor scan ──────────────────────────────
-            # CC's permission prompt has a stable frame:
+            # CC has TWO prompt shapes we recognize:
             #
+            # PERMISSION (standard Yes/No tool-use ask):
             #   Do you want to proceed?          ← START anchor
             #   ❯ 1. Yes                          ← option lines
             #     2. No
-            #                                     ← (optional blank)
             #   Esc to cancel · Tab to amend …    ← END anchor
             #
-            # Find the END anchor bottom-up, walk up to the START
-            # anchor, parse option lines ONLY between them.  Numbered
-            # chat prose lives ABOVE the START anchor → never scanned.
-            # Lines between the anchors that don't match the option
-            # regex (blanks, wrapped option-text continuations) are
-            # skipped — NOT treated as block boundaries — so long
-            # wrapped option labels still parse.
+            # QUESTION (AskUserQuestion tool — richer, multi-line):
+            #   ←  ☐ Step1  ☐ Step2  ✔ Submit  →     ← optional header
+            #   Which version number for this bump?  ← QUESTION line (?$)
+            #   ❯ 1. 1.16.0 (Recommended)             ← option
+            #        Minor bump for the macOS Mode … ← multi-line desc
+            #     2. 1.15.23
+            #        Patch bump …
+            #     3. 2.0.0
+            #        Major bump …
+            #     4. Type something.                  ← free-text kind
+            #     5. Chat about this                  ← chat kind
+            #   Enter to select · Tab/Arrow … Esc to cancel  ← END
             #
-            # Option regex groups:
-            #   1 = optional cursor marker (`❯' or `>')
-            #   2 = digit string
-            #   3 = label — must start with a non-digit non-whitespace
-            #       char so version strings (`1.0') don't match.
-            #       `\s*' (not `\s+') after the dot tolerates CC's
-            #       wrap squeezing out the space (`2.Yes').
-            end_re = re.compile(
-                r'(Esc to cancel|Tab to amend|ctrl\+e to explain'
-                r'|Esc to interrupt)')
-            start_re = re.compile(r'Do you want to')
+            # We try permission first (cheap), then question.  Both
+            # share the same option regex.  `prompt_kind' in the
+            # response tells the caller which shape was matched.
             opt_re = re.compile(
                 r'^\s*([❯>])?\s*(\d+)\.\s*([^\d\s].*?)\s*$')
 
             # DIAG: temporary instrumentation for native-iTerm scrapes
-            # that come back `unstructured' even when a permission
-            # prompt is visibly on screen.  Appends the raw scraped
-            # lines to /tmp/cc-bridge-inspect-pane.log so we can see
-            # exactly what `async_get_contents' is producing.  Scoped
-            # to the iTerm path only — tmux scrapes returning
-            # unstructured are normal (CC idle at empty prompt) and
-            # would just pollute the log.
+            # that come back `unstructured' even when a prompt is
+            # visibly on screen.  Appends raw scraped lines to
+            # /tmp/cc-bridge-inspect-pane.log.  Scoped to the iTerm
+            # path only — tmux scrapes returning unstructured are
+            # normal (CC idle at empty prompt) and would pollute the log.
             def _log_unstructured(reason):
                 if source != "iterm":
                     return
@@ -2040,65 +2201,220 @@ async def handle_control(request, connection):
                 except Exception:
                     pass
 
-            # END anchor — bottom-up, last ~25 lines (an active prompt
-            # always renders at the bottom of the pane).
-            end_idx = None
-            scan_lo = max(0, len(text_lines) - 25)
-            for i in range(len(text_lines) - 1, scan_lo - 1, -1):
-                if end_re.search(text_lines[i]):
-                    end_idx = i
-                    break
-            if end_idx is None:
-                _log_unstructured("no_end_anchor")
-                return aiohttp.web.json_response(
-                    {"type": "unstructured"})
+            # ── Permission-style scan ────────────────────────────
+            permission_end_re = re.compile(
+                r'(Esc to cancel|Tab to amend|ctrl\+e to explain'
+                r'|Esc to interrupt)')
+            permission_start_re = re.compile(r'Do you want to')
 
-            # START anchor — walk up from END, within ~20 lines
-            # (CC's prompt block is compact).
-            start_idx = None
-            walk_lo = max(0, end_idx - 20)
-            for i in range(end_idx - 1, walk_lo - 1, -1):
-                if start_re.search(text_lines[i]):
-                    start_idx = i
-                    break
-            if start_idx is None:
-                _log_unstructured("no_start_anchor")
-                return aiohttp.web.json_response(
-                    {"type": "unstructured"})
+            def _scan_permission():
+                """Try to parse text_lines as a permission prompt.
+                Returns response dict on success, None on miss."""
+                end_idx = None
+                scan_lo = max(0, len(text_lines) - 25)
+                for i in range(len(text_lines) - 1, scan_lo - 1, -1):
+                    if permission_end_re.search(text_lines[i]):
+                        end_idx = i
+                        break
+                if end_idx is None:
+                    return None
+                start_idx = None
+                walk_lo = max(0, end_idx - 20)
+                for i in range(end_idx - 1, walk_lo - 1, -1):
+                    if permission_start_re.search(text_lines[i]):
+                        start_idx = i
+                        break
+                if start_idx is None:
+                    return None
+                parsed = []
+                for line in text_lines[start_idx + 1:end_idx]:
+                    m = opt_re.match(line)
+                    if not m:
+                        continue
+                    try:
+                        idx = int(m.group(2))
+                    except ValueError:
+                        continue
+                    parsed.append((m.group(1) is not None,
+                                   idx, m.group(3)))
+                if not parsed:
+                    return None
+                parsed.sort(key=lambda r: r[1])
+                options = [r[2] for r in parsed]
+                cursor = next(
+                    (i for i, r in enumerate(parsed) if r[0]), 0)
+                # Build minimal `options_rich' so downstream renderers
+                # have a uniform shape across permission + question.
+                # Permission prompts don't carry per-option metadata
+                # (no Recommended tag, no descriptions, no free-text /
+                # chat kinds) so every entry is a plain "choice".
+                options_rich = [
+                    {"number": idx + 1,
+                     "label": label,
+                     "tag": None,
+                     "kind": "choice",
+                     "description": None}
+                    for idx, label in enumerate(options)
+                ]
+                return {
+                    "type": "numbered",
+                    "prompt_kind": "permission",
+                    "cursor": cursor,
+                    "options": options,
+                    "options_rich": options_rich,
+                    "question": None,
+                    "header": None,
+                }
 
-            # Parse option lines strictly between START and END.
-            parsed = []
-            for line in text_lines[start_idx + 1:end_idx]:
-                m = opt_re.match(line)
-                if not m:
-                    continue   # blank / wrapped continuation / etc.
-                try:
-                    idx = int(m.group(2))
-                except ValueError:
-                    continue
-                # Tuple: (has-cursor-marker?, declared-index, label).
-                parsed.append((m.group(1) is not None,
-                               idx, m.group(3)))
-            if not parsed:
-                _log_unstructured("options_empty")
+            # ── Question-style scan ──────────────────────────────
+            question_end_re = re.compile(
+                r'Enter to select.*Tab.*navigate.*Esc to cancel')
+            # Checkbox header: arrows + checkbox glyphs around step names.
+            question_header_re = re.compile(
+                r'[←→↓↑]|[☐✔☑]')
+            # Divider lines we should skip between option blocks (full
+            # rule of box-drawing or dash chars).
+            divider_re = re.compile(
+                r'^[\s─━═┄┅╌╍\-_·]+$')
+            # Recommendation suffix.
+            recommended_re = re.compile(
+                r'\s*\((Recommended|recommended)\)\s*$')
+
+            def _scan_question():
+                """Try to parse text_lines as an AskUserQuestion prompt.
+                Returns response dict on success, None on miss."""
+                end_idx = None
+                # Question prompts can be taller; scan further up.
+                scan_lo = max(0, len(text_lines) - 35)
+                for i in range(len(text_lines) - 1, scan_lo - 1, -1):
+                    if question_end_re.search(text_lines[i]):
+                        end_idx = i
+                        break
+                if end_idx is None:
+                    return None
+                # Find all option lines between somewhere-above and END
+                # (looking up to 50 lines for tall question blocks).
+                opt_indices = []
+                walk_lo = max(0, end_idx - 50)
+                for i in range(end_idx - 1, walk_lo - 1, -1):
+                    if opt_re.match(text_lines[i]):
+                        opt_indices.append(i)
+                if not opt_indices:
+                    return None
+                opt_indices.sort()   # ascending
+                first_opt_idx = opt_indices[0]
+                # Group option lines with their multi-line descriptions
+                # (lines between consecutive options that aren't
+                # dividers or blanks belong to the previous option).
+                parsed_q = []
+                current = None
+                for i in range(first_opt_idx, end_idx):
+                    line = text_lines[i]
+                    m = opt_re.match(line)
+                    if m:
+                        if current is not None:
+                            parsed_q.append(current)
+                        try:
+                            num = int(m.group(2))
+                        except ValueError:
+                            continue
+                        label = m.group(3).strip()
+                        tag = None
+                        rec_m = recommended_re.search(label)
+                        if rec_m:
+                            label = label[:rec_m.start()].strip()
+                            tag = "Recommended"
+                        label_l = label.lower()
+                        if label_l.startswith("type something"):
+                            kind = "free_text"
+                        elif label_l.startswith("chat about this"):
+                            kind = "chat"
+                        else:
+                            kind = "choice"
+                        current = {
+                            "number": num,
+                            "label": label,
+                            "tag": tag,
+                            "kind": kind,
+                            "has_cursor": m.group(1) is not None,
+                            "_desc_lines": [],
+                        }
+                    else:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if divider_re.match(line):
+                            continue
+                        if current is not None:
+                            current["_desc_lines"].append(stripped)
+                if current is not None:
+                    parsed_q.append(current)
+                if not parsed_q:
+                    return None
+                parsed_q.sort(key=lambda r: r["number"])
+                # Flatten desc lines.
+                for p in parsed_q:
+                    desc_lines = p.pop("_desc_lines")
+                    p["description"] = (" ".join(desc_lines)
+                                        if desc_lines else None)
+                # Find QUESTION line above first_opt_idx — nearest
+                # non-blank, non-divider line ending in `?' (or `:').
+                # Walk up to 10 lines.
+                question_text = None
+                header_text = None
+                search_lo = max(0, first_opt_idx - 10)
+                for i in range(first_opt_idx - 1, search_lo - 1, -1):
+                    raw = text_lines[i]
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    if divider_re.match(raw):
+                        continue
+                    if question_header_re.search(stripped):
+                        # Header line — could be ABOVE the question.
+                        if header_text is None:
+                            header_text = stripped
+                        continue
+                    if question_text is None and (stripped.endswith("?")
+                                                   or stripped.endswith(":")):
+                        question_text = stripped
+                        # Continue scanning up one more line for the header.
+                        continue
+                    if question_text is not None:
+                        # We've already got the question — stop unless
+                        # this line is the header (handled above).
+                        break
+                cursor_q = next(
+                    (i for i, p in enumerate(parsed_q)
+                     if p.get("has_cursor")), 0)
+                # Drop transient has_cursor from each option (caller
+                # uses the top-level `cursor' index).
+                for p in parsed_q:
+                    p.pop("has_cursor", None)
+                options_flat = [p["label"] for p in parsed_q]
+                return {
+                    "type": "numbered",
+                    "prompt_kind": "question",
+                    "cursor": cursor_q,
+                    "options": options_flat,
+                    "options_rich": parsed_q,
+                    "question": question_text,
+                    "header": header_text,
+                }
+
+            # Try permission first (cheap; common case).  Fall through
+            # to question on miss.  Both miss → unstructured.
+            result = _scan_permission()
+            if result is None:
+                result = _scan_question()
+            if result is None:
+                _log_unstructured("unstructured")
                 return aiohttp.web.json_response(
                     {"type": "unstructured"})
-            parsed.sort(key=lambda r: r[1])
-            options = [r[2] for r in parsed]
-            # First option carrying the cursor marker wins; default
-            # 0 (CC's prompts open with the cursor on option 1).
-            cursor = next(
-                (i for i, r in enumerate(parsed) if r[0]),
-                0)
-            # DIAG: log numbered returns from the iTerm path too — lets
-            # us compare a first-scrape (mid-render) result against the
-            # 500ms verify-stabilize result and confirm the race fix.
-            _log_unstructured(f"numbered:{len(options)}")
-            return aiohttp.web.json_response({
-                "type": "numbered",
-                "cursor": cursor,
-                "options": options,
-            })
+            _log_unstructured(
+                f"numbered_{result['prompt_kind']}:"
+                f"{len(result['options'])}")
+            return aiohttp.web.json_response(result)
 
         elif action == 'send_keys_to_iid':
             # Send a sequence of named keys to an iTerm pane.  Used
