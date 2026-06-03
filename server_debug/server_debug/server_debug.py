@@ -1735,6 +1735,14 @@ async def handle_control(request, connection):
                     clean_panes.append(p)
             # Enumerate `claude-running-*' tmux sessions; emit those
             # not yet covered by an attached pane in runner_panes.
+            #
+            # Cwd lookup is batched into ONE `tmux list-panes -a' call
+            # instead of N `display-message' subprocesses.  With ~3+
+            # runners that collapses N fork+execs into 1 — saves
+            # ~10-25 ms per `find_running_panes' invocation.  First
+            # pane per session wins (matches `display-message's
+            # default of pointing at the active pane, which is
+            # typically the first one for a detached runner).
             unattached_runners = []
             if _TMUX_BIN:
                 try:
@@ -1749,19 +1757,26 @@ async def handle_control(request, connection):
                         and ln not in covered_runners]
                 except Exception:
                     candidate_names = []
-                for name in candidate_names:
+                cwd_by_session = {}
+                if candidate_names:
                     try:
-                        cwd = subprocess.check_output(
-                            [_TMUX_BIN, "display-message",
-                             "-p", "-t", name,
-                             "-F", "#{pane_current_path}"],
+                        out = subprocess.check_output(
+                            [_TMUX_BIN, "list-panes", "-a",
+                             "-F",
+                             "#{session_name}\t#{pane_current_path}"],
                             text=True, timeout=2,
-                            stderr=subprocess.DEVNULL).strip()
+                            stderr=subprocess.DEVNULL)
+                        for ln in out.splitlines():
+                            parts = ln.split("\t", 1)
+                            if len(parts) == 2:
+                                cwd_by_session.setdefault(
+                                    parts[0], parts[1])
                     except Exception:
-                        cwd = ""
+                        pass
+                for name in candidate_names:
                     unattached_runners.append({
                         "tmux_session": name,
-                        "cwd": cwd,
+                        "cwd": cwd_by_session.get(name, ""),
                     })
             return aiohttp.web.json_response({
                 "clean_panes": clean_panes,
