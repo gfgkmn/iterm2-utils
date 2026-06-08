@@ -2459,6 +2459,66 @@ async def handle_control(request, connection):
                 "status": "ok", "sent": sent,
             })
 
+        elif action == 'send_keys_to_tmux':
+            # Tmux-native sibling of `send_keys_to_iid'.  When the CC
+            # session lives ONLY in tmux (no iTerm pane attached),
+            # there's no iid to target — we send keystrokes directly
+            # via `tmux send-keys -t SESSION ...'.  Reaches the active
+            # pane in the session, which is where CC's TUI renders.
+            #
+            # Used by the Emacs Authority dispatcher
+            # (`--notify-options-choose') as a fallback when iid
+            # resolution fails AND cc-state carries a tmux_session.
+            tmux_session = data.get('tmux_session')
+            keys = data.get('keys') or []
+            if not tmux_session:
+                return aiohttp.web.json_response(
+                    {"error": "missing tmux_session"}, status=400)
+            if not isinstance(keys, list):
+                return aiohttp.web.json_response(
+                    {"error": "keys must be a list"}, status=400)
+            if not _TMUX_BIN:
+                return aiohttp.web.json_response(
+                    {"error": "tmux binary not available"}, status=500)
+            # Tmux's native key syntax differs from ANSI escapes —
+            # `Down' instead of `\x1b[B', etc.  See `tmux(1)' KEY
+            # BINDINGS for the full list.
+            keymap = {
+                "down":  "Down",
+                "up":    "Up",
+                "right": "Right",
+                "left":  "Left",
+                "enter": "Enter",
+                "esc":   "Escape",
+            }
+            args = [_TMUX_BIN, "send-keys", "-t", tmux_session]
+            sent = []
+            for k in keys:
+                tk = keymap.get(str(k).lower())
+                if tk is None:
+                    continue   # ignore unknown key names silently
+                args.append(tk)
+                sent.append(k)
+            # `tmux send-keys' accepts multiple key tokens per
+            # invocation — ONE subprocess for the whole sequence.
+            if sent:
+                try:
+                    rc = subprocess.run(
+                        args, timeout=2,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE).returncode
+                    if rc != 0:
+                        return aiohttp.web.json_response(
+                            {"error":
+                             f"tmux send-keys returned {rc}"},
+                            status=500)
+                except Exception as e:
+                    return aiohttp.web.json_response(
+                        {"error": str(e)}, status=500)
+            return aiohttp.web.json_response({
+                "status": "ok", "sent": sent,
+            })
+
         elif action == 'inspect_active_pane':
             # Single-call context probe for the iTerm pane currently focused.
             # Used by the Karabiner / Keyboard Maestro shortcut scripts —
