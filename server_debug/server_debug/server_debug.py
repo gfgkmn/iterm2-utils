@@ -2267,8 +2267,18 @@ async def handle_control(request, connection):
                 }
 
             # ── Question-style scan ──────────────────────────────
+            # CC's question footer comes in two variants observed in
+            # the wild:
+            #   `Enter to select · Tab/Arrow keys to navigate · Esc to cancel'
+            #     — multi-question forms (Tab switches question groups)
+            #   `Enter to select · ↑/↓ to navigate · Esc to cancel'
+            #     — single-question prompts
+            # The anchor matches both — only require `to navigate'
+            # between `Enter to select' and `Esc to cancel', not
+            # specifically `Tab'.  Any future navigation-hint variant
+            # ending in `to navigate' is also caught for free.
             question_end_re = re.compile(
-                r'Enter to select.*Tab.*navigate.*Esc to cancel')
+                r'Enter to select.*to navigate.*Esc to cancel')
             # Checkbox header: arrows + checkbox glyphs around step names.
             question_header_re = re.compile(
                 r'[←→↓↑]|[☐✔☑]')
