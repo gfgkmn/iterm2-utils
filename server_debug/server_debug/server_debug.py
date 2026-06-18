@@ -2402,6 +2402,51 @@ async def handle_control(request, connection):
                 for p in parsed_q:
                     p.pop("has_cursor", None)
                 options_flat = [p["label"] for p in parsed_q]
+                # Capture CC's reply prose ABOVE the question.  AskUser-
+                # Question prompts (the screenshot case) frequently
+                # contain decision-relevant context — phased plans,
+                # bullet-list trade-offs, risk discussion — that the
+                # user needs to read to pick an option.  Without this
+                # they have to switch to iTerm to scroll, defeating
+                # the point of answering in Emacs.
+                #
+                # Bounding: walk up from the question (or first option
+                # if no question_text was found) to at most 60 lines.
+                # No hard top anchor — CC's `❯' user-prompt marker is
+                # often scrolled off in non-alt-screen line-mode, so
+                # we lean on the line-count cap instead.  Caller will
+                # truncate further for display.
+                #
+                # Trimming: drop leading + trailing blank lines, drop
+                # pure-divider lines (they're already visually
+                # separating the prompt box from prose; redundant).
+                MAX_CTX_LINES = 60
+                ctx_top = first_opt_idx
+                # If we found a question line, the context is what's
+                # above THAT line; otherwise above the first option.
+                ctx_bottom = None
+                if question_text is not None:
+                    for i in range(first_opt_idx - 1, -1, -1):
+                        s = text_lines[i].strip()
+                        if s == question_text:
+                            ctx_bottom = i
+                            break
+                if ctx_bottom is None:
+                    ctx_bottom = first_opt_idx
+                ctx_hi = ctx_bottom            # exclusive upper bound
+                ctx_lo = max(0, ctx_hi - MAX_CTX_LINES)
+                raw_ctx = text_lines[ctx_lo:ctx_hi]
+                # Drop pure-divider and pure-blank lines from both ends.
+                def _trim_ctx(lines):
+                    def _drop(ln):
+                        s = ln.strip()
+                        return (not s) or bool(divider_re.match(ln))
+                    while lines and _drop(lines[0]):
+                        lines = lines[1:]
+                    while lines and _drop(lines[-1]):
+                        lines = lines[:-1]
+                    return lines
+                context_lines = _trim_ctx(list(raw_ctx))
                 return {
                     "type": "numbered",
                     "prompt_kind": "question",
@@ -2410,6 +2455,7 @@ async def handle_control(request, connection):
                     "options_rich": parsed_q,
                     "question": question_text,
                     "header": header_text,
+                    "context_lines": context_lines,
                 }
 
             # Try permission first (cheap; common case).  Fall through
