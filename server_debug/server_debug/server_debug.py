@@ -2417,9 +2417,14 @@ async def handle_control(request, connection):
                 # we lean on the line-count cap instead.  Caller will
                 # truncate further for display.
                 #
-                # Trimming: drop leading + trailing blank lines, drop
-                # pure-divider lines (they're already visually
-                # separating the prompt box from prose; redundant).
+                # Trimming: drop pure-divider lines EVERYWHERE (CC's TUI
+                # section separators span the full terminal width — they
+                # wrap unhelpfully in a narrower delegate buffer), drop
+                # the captured header line wherever it appears in raw_ctx
+                # (it will be rendered separately by the Emacs side via
+                # the :header key, so keeping it in :context_lines would
+                # double-print it), then trim leading + trailing blank
+                # lines.
                 MAX_CTX_LINES = 60
                 ctx_top = first_opt_idx
                 # If we found a question line, the context is what's
@@ -2436,16 +2441,20 @@ async def handle_control(request, connection):
                 ctx_hi = ctx_bottom            # exclusive upper bound
                 ctx_lo = max(0, ctx_hi - MAX_CTX_LINES)
                 raw_ctx = text_lines[ctx_lo:ctx_hi]
-                # Drop pure-divider and pure-blank lines from both ends.
+                _header_strip = (header_text or "").strip()
                 def _trim_ctx(lines):
-                    def _drop(ln):
-                        s = ln.strip()
-                        return (not s) or bool(divider_re.match(ln))
-                    while lines and _drop(lines[0]):
-                        lines = lines[1:]
-                    while lines and _drop(lines[-1]):
-                        lines = lines[:-1]
-                    return lines
+                    out = []
+                    for ln in lines:
+                        if divider_re.match(ln):
+                            continue
+                        if _header_strip and ln.strip() == _header_strip:
+                            continue
+                        out.append(ln)
+                    while out and not out[0].strip():
+                        out = out[1:]
+                    while out and not out[-1].strip():
+                        out = out[:-1]
+                    return out
                 context_lines = _trim_ctx(list(raw_ctx))
                 return {
                     "type": "numbered",
