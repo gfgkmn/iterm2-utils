@@ -1579,6 +1579,106 @@ async def handle_control(request, connection):
             results = [r for r in pane_results if r is not None]
             return aiohttp.web.json_response({"sessions": results})
 
+        elif action == 'find_all_cc_sessions':
+            # Union of ATTACHED CC panes (an iTerm pane carries the CC
+            # process) AND UNATTACHED-but-alive CC sessions (the CC
+            # process is live in tmux, but no iTerm pane attaches to
+            # its tmux client).  Used by Hammerspoon's
+            # `jump-to-cc-pick' chooser to give a context-free picker
+            # over every running CC, mirroring the Emacs
+            # `claude-code-bridge-handoff-pick'.
+            #
+            # LOCAL ONLY — remote/TRAMP CC enumeration stays on the
+            # Emacs side (needs `ssh -S socket' + TRAMP plumbing).
+            # The Hammerspoon chooser can only activate panes on
+            # THIS Mac anyway, so this is correct scope.
+            #
+            # Returns:
+            #   {"attached":   [<find_claude_sessions row>, ...],
+            #    "unattached": [{session_id, session_name,
+            #                    tmux_session, cwd, hostname}, ...]}
+            #
+            # Implementation mirrors `find_claude_sessions' for the
+            # attached partition (reuses the same caches: registry,
+            # cc-state, children-map, tmux-tty, tmux-panes).  The
+            # unattached partition is computed as
+            #   alive_uuids - attached_uuids
+            # where `alive_uuids' comes from
+            # `_load_sessions_registry()' (a CC process is alive if
+            # its `sessions/<pid>.json' exists AND `os.kill(pid, 0)'
+            # succeeded).  Each unattached uuid is enriched from
+            # cc-state for the rendering fields.
+            app = await iterm2.async_get_app(connection)
+            await _throttled_app_refresh(app)
+            registry = _load_sessions_registry()
+            by_uuid = _load_cc_state_by_uuid()
+            children_map = _build_children_map()
+            tmux_by_tty = _tmux_clients_by_tty()
+            panes_by_session = _tmux_panes_by_session()
+
+            async def _process_pane_min(window, tab, session):
+                """Like the inner walker in `find_claude_sessions',
+                but lean: only the fields Hammerspoon's chooser
+                renders + the `session_id' used for dedup."""
+                try:
+                    cc_info, hostname_or_exc = await asyncio.gather(
+                        claude_info_for_pane(
+                            session,
+                            registry=registry,
+                            by_uuid=by_uuid,
+                            children_map=children_map,
+                            tmux_by_tty=tmux_by_tty,
+                            panes_by_session=panes_by_session),
+                        session.async_get_variable("hostname"),
+                        return_exceptions=True)
+                    if isinstance(cc_info, BaseException):
+                        return None
+                    if not cc_info.get("session_id"):
+                        return None
+                    hostname = (
+                        "" if isinstance(hostname_or_exc, BaseException)
+                        else (hostname_or_exc or ""))
+                    return {
+                        "iid":          session.session_id,
+                        "session_id":   cc_info.get("session_id"),
+                        "session_name": cc_info.get("session_name"),
+                        "tmux_session": cc_info.get("tmux_session"),
+                        "cwd":          cc_info.get("current_dir") or "",
+                        "hostname":     hostname,
+                    }
+                except Exception:
+                    return None
+
+            pane_results = await asyncio.gather(*[
+                _process_pane_min(window, tab, session)
+                for window in app.windows
+                for tab in window.tabs
+                for session in tab.sessions
+            ], return_exceptions=False)
+            attached = [r for r in pane_results if r is not None]
+            attached_uuids = {r["session_id"] for r in attached
+                              if r.get("session_id")}
+            # Registry is keyed by pid; pull each entry's session_id.
+            alive_uuids = set()
+            for _pid, entry in registry.items():
+                sid = entry.get("sessionId") or entry.get("session_id")
+                if sid:
+                    alive_uuids.add(sid)
+            unattached = []
+            for sid in sorted(alive_uuids - attached_uuids):
+                ccs = by_uuid.get(sid) or {}
+                unattached.append({
+                    "session_id":   sid,
+                    "session_name": ccs.get("session_name"),
+                    "tmux_session": ccs.get("tmux_session"),
+                    "cwd":          ccs.get("cwd") or "",
+                    "hostname":     "",
+                })
+            return aiohttp.web.json_response({
+                "attached":   attached,
+                "unattached": unattached,
+            })
+
         elif action == 'find_all_panes':
             # Return EVERY iTerm pane (not just the CC ones the way
             # `find_claude_sessions' does) with the cosmetic fields the
