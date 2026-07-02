@@ -2302,19 +2302,49 @@ async def handle_control(request, connection):
                     pass
 
             # ── Permission-style scan ────────────────────────────
+            # End-anchor alternations:
+            #   - `Esc to cancel|Tab to amend|ctrl+e to explain|Esc to
+            #     interrupt' — classic CC TUI variant with a separate
+            #     hint line below the option block.
+            #   - `^\s*\d+\.\s.*\(esc\)\s*$' — newer "footer-as-option"
+            #     variant where the LAST option itself carries the
+            #     trailing `(esc)' marker (e.g. `No, and tell Claude
+            #     what to do differently (esc)').  Both `\d+.' start
+            #     and `(esc)' end anchors guard against false-positive
+            #     matches on unrelated prose.  When this branch fires,
+            #     `end_is_option' below extends the option-walk slice
+            #     to INCLUDE end_idx — otherwise the third option gets
+            #     silently dropped.
             permission_end_re = re.compile(
                 r'(Esc to cancel|Tab to amend|ctrl\+e to explain'
-                r'|Esc to interrupt)')
-            permission_start_re = re.compile(r'Do you want to')
+                r'|Esc to interrupt'
+                r'|^\s*\d+\.\s.*\(esc\)\s*$)')
+            # Start-anchor alternations for the permission scan.
+            #   `Do you want to' — classic CC PreToolUse permission
+            #     prompt (Bash / Edit / Write / etc.).
+            #   `Accessing workspace' — CC's pre-startup trust dialog
+            #     (fired on the FIRST claude launch in an untrusted
+            #     directory).  Same numbered-options shape as regular
+            #     permission prompts, same `Esc to cancel' footer, so
+            #     it slots into `_scan_permission' cleanly.  Unique to
+            #     the trust dialog — safe from false positives.
+            permission_start_re = re.compile(
+                r'(Do you want to|Accessing workspace)')
 
             def _scan_permission():
                 """Try to parse text_lines as a permission prompt.
                 Returns response dict on success, None on miss."""
                 end_idx = None
+                end_is_option = False
                 scan_lo = max(0, len(text_lines) - 25)
                 for i in range(len(text_lines) - 1, scan_lo - 1, -1):
                     if permission_end_re.search(text_lines[i]):
                         end_idx = i
+                        # Newer CC variant: the end anchor IS the last
+                        # option line.  Mark this so the option walk
+                        # below extends past end_idx to include it.
+                        end_is_option = bool(
+                            opt_re.match(text_lines[i]))
                         break
                 if end_idx is None:
                     return None
@@ -2326,8 +2356,9 @@ async def handle_control(request, connection):
                         break
                 if start_idx is None:
                     return None
+                walk_end = end_idx + 1 if end_is_option else end_idx
                 parsed = []
-                for line in text_lines[start_idx + 1:end_idx]:
+                for line in text_lines[start_idx + 1:walk_end]:
                     m = opt_re.match(line)
                     if not m:
                         continue
