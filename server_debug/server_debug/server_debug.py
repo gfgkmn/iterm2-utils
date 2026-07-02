@@ -2447,6 +2447,9 @@ async def handle_control(request, connection):
                 # Group option lines with their multi-line descriptions
                 # (lines between consecutive options that aren't
                 # dividers or blanks belong to the previous option).
+                # We STORE each option's screen-line index in `_opt_idx'
+                # so we can later scope per-question (header + question
+                # text) lookups to the slice between adjacent groups.
                 parsed_q = []
                 current = None
                 for i in range(first_opt_idx, end_idx):
@@ -2479,6 +2482,7 @@ async def handle_control(request, connection):
                             "kind": kind,
                             "has_cursor": m.group(1) is not None,
                             "_desc_lines": [],
+                            "_opt_idx": i,
                         }
                     else:
                         stripped = line.strip()
@@ -2492,47 +2496,108 @@ async def handle_control(request, connection):
                     parsed_q.append(current)
                 if not parsed_q:
                     return None
-                parsed_q.sort(key=lambda r: r["number"])
+                # NOTE: deliberately NO `parsed_q.sort(key=number)' here.
+                # That sort was inserted for a single-question prompt
+                # (idempotent — options are already in number order on
+                # screen) but it INTERLEAVED multi-question prompts that
+                # render `1,2,3,1,2,3' on screen into `1,1,2,2,3,3'.
+                # Keeping screen order lets the partition below split
+                # cleanly along question boundaries.
+                #
                 # Flatten desc lines.
                 for p in parsed_q:
                     desc_lines = p.pop("_desc_lines")
                     p["description"] = (" ".join(desc_lines)
                                         if desc_lines else None)
-                # Find QUESTION line above first_opt_idx — nearest
-                # non-blank, non-divider line ending in `?' (or `:').
-                # Walk up to 10 lines.
-                question_text = None
-                header_text = None
-                search_lo = max(0, first_opt_idx - 10)
-                for i in range(first_opt_idx - 1, search_lo - 1, -1):
-                    raw = text_lines[i]
-                    stripped = raw.strip()
-                    if not stripped:
-                        continue
-                    if divider_re.match(raw):
-                        continue
-                    if question_header_re.search(stripped):
-                        # Header line — could be ABOVE the question.
-                        if header_text is None:
-                            header_text = stripped
-                        continue
-                    if question_text is None and (stripped.endswith("?")
-                                                   or stripped.endswith(":")):
-                        question_text = stripped
-                        # Continue scanning up one more line for the header.
-                        continue
-                    if question_text is not None:
-                        # We've already got the question — stop unless
-                        # this line is the header (handled above).
-                        break
+
+                # Partition parsed_q into groups, one per question.  A
+                # new group starts whenever the next option's `number'
+                # is <= the previous option's number.  Covers both the
+                # `1,2,3,1,2,3' shape (CC rendering Q1's full list then
+                # Q2's full list) and the `1,2,1,2,3' shape (one Q has
+                # more options than the other).
+                groups = []
+                cur_group = []
+                prev_num = 0
+                for p in parsed_q:
+                    if cur_group and p["number"] <= prev_num:
+                        groups.append(cur_group)
+                        cur_group = []
+                    cur_group.append(p)
+                    prev_num = p["number"]
+                if cur_group:
+                    groups.append(cur_group)
+
+                # Per-group question text + header lookup.  Walks up
+                # from the group's FIRST option line index, bounded by
+                # the prior group's LAST option line index (exclusive)
+                # so we don't cross into a sibling question's prose.
+                # For the first group (`prior_last_idx_excl = -1') the
+                # window is the full 10 lines above its first option.
+                def _find_group_qhdr(g, prior_last_idx_excl):
+                    first_opt = g[0]["_opt_idx"]
+                    search_lo = max(0, first_opt - 10,
+                                    prior_last_idx_excl + 1)
+                    g_q = None
+                    g_h = None
+                    for i in range(first_opt - 1, search_lo - 1, -1):
+                        raw = text_lines[i]
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        if divider_re.match(raw):
+                            continue
+                        if question_header_re.search(stripped):
+                            if g_h is None:
+                                g_h = stripped
+                            continue
+                        if g_q is None and (stripped.endswith("?")
+                                            or stripped.endswith(":")):
+                            g_q = stripped
+                            continue
+                        if g_q is not None:
+                            break
+                    return g_q, g_h
+
+                questions = []
+                prior_last = -1
+                for g in groups:
+                    g_question, g_header = _find_group_qhdr(g, prior_last)
+                    g_options = [p["label"] for p in g]
+                    # Clone per-option dicts WITHOUT the internal
+                    # `_opt_idx' / `has_cursor' scaffolding.
+                    g_rich = [
+                        {k: v for k, v in p.items()
+                         if k not in ("_opt_idx", "has_cursor")}
+                        for p in g
+                    ]
+                    questions.append({
+                        "header":       g_header,
+                        "question":     g_question,
+                        "options":      g_options,
+                        "options_rich": g_rich,
+                    })
+                    prior_last = g[-1]["_opt_idx"]
+
+                # Flat cursor across all groups (back-compat).  Compute
+                # BEFORE dropping `has_cursor' from parsed_q.
                 cursor_q = next(
                     (i for i, p in enumerate(parsed_q)
                      if p.get("has_cursor")), 0)
-                # Drop transient has_cursor from each option (caller
-                # uses the top-level `cursor' index).
+                # Strip scaffolding from the flat parsed_q too.
                 for p in parsed_q:
                     p.pop("has_cursor", None)
+                    p.pop("_opt_idx", None)
                 options_flat = [p["label"] for p in parsed_q]
+
+                # Legacy single-key snapshot from the FIRST group.  The
+                # Emacs side reads `:question'/`:header'/`:options'/
+                # `:options_rich' for the single-question render path
+                # and `:questions' for the wizard path; routing happens
+                # there based on `len(questions)'.
+                first_q = questions[0] if questions else {}
+                question_text = first_q.get("question")
+                header_text = first_q.get("header")
                 # Capture CC's reply prose ABOVE the question.  AskUser-
                 # Question prompts (the screenshot case) frequently
                 # contain decision-relevant context — phased plans,
@@ -2596,6 +2661,11 @@ async def handle_control(request, connection):
                     "question": question_text,
                     "header": header_text,
                     "context_lines": context_lines,
+                    # Wizard-mode payload.  For single-question prompts
+                    # `len(questions) == 1' and the Emacs renderer takes
+                    # the legacy single-question path; for >1 it routes
+                    # through the wizard installer (Task #28).
+                    "questions": questions,
                 }
 
             # Try permission first (cheap; common case).  Fall through
@@ -2640,7 +2710,12 @@ async def handle_control(request, connection):
                 "left":  "\x1b[D",
                 "enter": "\r",
                 "esc":   "\x1b",
+                "tab":   "\t",
             }
+            # Digit chars `1'..`9' send themselves — used by the
+            # wizard replay (Task #27) to answer per-question picks.
+            for _d in "123456789":
+                keymap[_d] = _d
             sent = []
             for k in keys:
                 seq = keymap.get(str(k).lower())
@@ -2653,6 +2728,34 @@ async def handle_control(request, connection):
                     pass
             return aiohttp.web.json_response({
                 "status": "ok", "sent": sent,
+            })
+
+        elif action == 'send_text_to_iid':
+            # Send raw text to an iTerm pane verbatim — no key-name
+            # mapping, no bracketed-paste wrap.  Used by the wizard
+            # free-text replay (Phase v2): once CC's TUI is in a
+            # free-text input field, we type the user's drafted answer
+            # one character at a time via `async_send_text'.
+            iid = data.get('iid')
+            text = data.get('text') or ''
+            if not iid:
+                return aiohttp.web.json_response(
+                    {"error": "missing iid"}, status=400)
+            if not isinstance(text, str):
+                return aiohttp.web.json_response(
+                    {"error": "text must be a string"}, status=400)
+            app = await iterm2.async_get_app(connection)
+            session = app.get_session_by_id(iid)
+            if not session:
+                return aiohttp.web.json_response(
+                    {"error": f"iid not found: {iid}"}, status=404)
+            try:
+                await session.async_send_text(text)
+            except Exception as e:
+                return aiohttp.web.json_response(
+                    {"error": f"send_text failed: {e}"}, status=500)
+            return aiohttp.web.json_response({
+                "status": "ok", "bytes": len(text),
             })
 
         elif action == 'send_keys_to_tmux':
@@ -2686,7 +2789,12 @@ async def handle_control(request, connection):
                 "left":  "Left",
                 "enter": "Enter",
                 "esc":   "Escape",
+                "tab":   "Tab",
             }
+            # Digit chars `1'..`9' send themselves — used by the
+            # wizard replay (Task #27) to answer per-question picks.
+            for _d in "123456789":
+                keymap[_d] = _d
             args = [_TMUX_BIN, "send-keys", "-t", tmux_session]
             sent = []
             for k in keys:
@@ -2713,6 +2821,42 @@ async def handle_control(request, connection):
                         {"error": str(e)}, status=500)
             return aiohttp.web.json_response({
                 "status": "ok", "sent": sent,
+            })
+
+        elif action == 'send_text_to_tmux':
+            # Tmux-native sibling of `send_text_to_iid'.  Sends raw
+            # text via `tmux send-keys -l <text>' (literal mode: -l
+            # treats the arg as plain characters, NOT key names — so
+            # `Enter' lands as the letters E-n-t-e-r, which is what
+            # we want when typing into CC's free-text field).
+            tmux_session = data.get('tmux_session')
+            text = data.get('text') or ''
+            if not tmux_session:
+                return aiohttp.web.json_response(
+                    {"error": "missing tmux_session"}, status=400)
+            if not isinstance(text, str):
+                return aiohttp.web.json_response(
+                    {"error": "text must be a string"}, status=400)
+            if not _TMUX_BIN:
+                return aiohttp.web.json_response(
+                    {"error": "tmux binary not available"}, status=500)
+            try:
+                rc = subprocess.run(
+                    [_TMUX_BIN, "send-keys", "-t", tmux_session,
+                     "-l", text],
+                    timeout=2,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE).returncode
+                if rc != 0:
+                    return aiohttp.web.json_response(
+                        {"error":
+                         f"tmux send-keys -l returned {rc}"},
+                        status=500)
+            except Exception as e:
+                return aiohttp.web.json_response(
+                    {"error": str(e)}, status=500)
+            return aiohttp.web.json_response({
+                "status": "ok", "bytes": len(text),
             })
 
         elif action == 'inspect_active_pane':
