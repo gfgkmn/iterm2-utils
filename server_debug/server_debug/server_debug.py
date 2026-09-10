@@ -1760,6 +1760,70 @@ async def handle_control(request, connection):
                 })
             return aiohttp.web.json_response({"iterm_session_id": None})
 
+        elif action == 'bridge_monitor_status':
+            return aiohttp.web.json_response(_monitor_state)
+        elif action == 'set_session_status':
+            # iTerm2 3.7 Session Status (OSC 21337): paint the CC session's
+            # tab with the bridge's state so the terminal shows what Emacs
+            # knows, on the same event that updated the dashboard.
+            #
+            # Pane resolution happens HERE, never from the hook's
+            # ITERM_SESSION_ID (frozen at tmux launch -- stale for every
+            # tmux-hosted CC).  A tmux session name wins: its attached
+            # client's tty identifies the live iTerm pane.  The cached iid
+            # is only a fallback for iTerm-hosted CC.
+            #
+            # `async_inject' feeds the sequence to iTerm's parser as if the
+            # program printed it: tmux never sees it, CC's screen is
+            # untouched (an OSC renders nothing), and it works on a pane
+            # running any TUI.
+            state = (data.get('state') or '').strip()
+            iid = data.get('iid')
+            tmux_session = data.get('tmux_session')
+            app = await iterm2.async_get_app(connection)
+            session = None
+            if tmux_session:
+                ttys = {t for t, s in _tmux_clients_by_tty().items()
+                        if s == tmux_session}
+                if ttys:
+                    await _throttled_app_refresh(app)
+                    for window in app.windows:
+                        for tab in window.tabs:
+                            for cand in tab.sessions:
+                                try:
+                                    if await cand.async_get_variable("tty") in ttys:
+                                        session = cand
+                                        break
+                                except Exception:
+                                    continue
+                            if session is not None:
+                                break
+                        if session is not None:
+                            break
+            if session is None and iid:
+                session = app.get_session_by_id(iid)
+            if session is None:
+                return aiohttp.web.json_response(
+                    {"ok": False, "error": "no pane for iid/tmux_session"},
+                    status=404)
+            colors = {"working": "#3b82f6",
+                      "waiting": "#f59e0b",
+                      "idle": "#22c55e"}
+            if state in colors:
+                # `status' stays one of iTerm's own words so the Session
+                # Status tool / Cockpit classify it; no free text here.
+                seq = (f"\x1b]21337;indicator={colors[state]};status={state};"
+                       f"status-color={colors[state]}\x07")
+            else:
+                seq = "\x1b]21337;indicator=;status=;status-color=\x07"
+            try:
+                await session.async_inject(seq.encode("utf-8"))
+            except Exception as e:
+                return aiohttp.web.json_response(
+                    {"ok": False, "error": str(e)}, status=500)
+            return aiohttp.web.json_response(
+                {"ok": True, "iterm_session_id": session.session_id,
+                 "state": state or "clear"})
         elif action == 'find_pane_by_tty':
             # Reverse-lookup: given a pty path like '/dev/ttys003' (typically
             # the output of `tmux list-clients -F #{client_tty}`), return the
@@ -3238,6 +3302,137 @@ async def handle_screen_content(request, connection):
             {'error': f'Error getting screen content: {str(e)}'}, status=500)
 
 
+# ---------------------------------------------------------------------------
+# Push monitors: tell Emacs the INSTANT a pane dies, `claude' starts or
+# stops in a pane, or a pane's hostname changes -- instead of letting the
+# dashboard infer all of that by re-scanning registries and screens every
+# tick.  Delivery is the same `emacsclient --eval' the hook script uses;
+# the Emacs side is `claude-code-bridge--on-iterm-event'.
+
+_EMACSCLIENT_CANDIDATES = (
+    "/opt/homebrew/bin/emacsclient",
+    "/Applications/Emacs.app/Contents/MacOS/bin/emacsclient",
+    os.path.expanduser("~/Applications/bin/emacsclient-iterm"),
+)
+
+
+def _emacsclient_path():
+    for c in _EMACSCLIENT_CANDIDATES:
+        if os.access(c, os.X_OK):
+            return c
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        c = os.path.join(d, "emacsclient")
+        if os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _elisp_str(s):
+    return '"' + str(s or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+_monitor_state = {"started": False, "events": 0, "last": None, "errors": []}
+
+
+def _monitor_error(where, exc):
+    _monitor_state["errors"].append(f"{where}: {type(exc).__name__}: {exc}")
+    del _monitor_state["errors"][:-20]
+
+
+async def _notify_emacs_event(kind, iid, value):
+    """Fire-and-forget push to Emacs.  Never raises; a dead Emacs is fine.
+    Plain `subprocess.Popen', deliberately NOT `asyncio.create_subprocess_exec':
+    the latter needs a child watcher wired to THIS loop (iTerm's runtime
+    loop), and the first event that ran it wedged the API connection for
+    every handler.  Popen touches no loop machinery and returns at once."""
+    ec = _emacsclient_path()
+    if not ec:
+        return
+    form = ("(when (fboundp (quote claude-code-bridge--on-iterm-event)) "
+            f"(claude-code-bridge--on-iterm-event {_elisp_str(kind)} "
+            f"{_elisp_str(iid)} {_elisp_str(value)}))")
+    _monitor_state["events"] += 1
+    _monitor_state["last"] = f"{kind} {iid} {value!r}"
+    try:
+        subprocess.Popen([ec, "--no-wait", "--eval", form],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as e:
+        _monitor_error("notify", e)
+
+
+async def _monitor_session_termination(connection):
+    try:
+        async with iterm2.SessionTerminationMonitor(connection) as mon:
+            while True:
+                iid = await mon.async_get()
+                _subprocess_cache.clear()
+                await _notify_emacs_event("session-ended", iid, "")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _monitor_error("termination", e)
+
+
+_last_job = {}  # session_id -> last jobName seen
+
+
+async def _monitor_session_variable(connection, session_id, name):
+    """Watch one session's variable NAME until the session goes away.
+    `jobName' changes on every shell command, so only transitions into
+    or out of a `claude' job are pushed; `hostname' changes are rare and
+    always pushed."""
+    try:
+        async with iterm2.VariableMonitor(
+                connection, iterm2.VariableScopes.SESSION, name,
+                session_id) as mon:
+            while True:
+                value = await mon.async_get()
+                if name == "jobName":
+                    prev = _last_job.get(session_id, "")
+                    _last_job[session_id] = value or ""
+                    if "claude" not in (prev or "") and "claude" not in (value or ""):
+                        continue
+                _subprocess_cache.clear()
+                await _notify_emacs_event(f"var:{name}", session_id, value)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _monitor_error(f"var:{name}:{session_id[:8]}", e)
+
+
+# Per-session variable monitors are behind a flag while their teardown is
+# investigated: `async_foreach_session_create_task' CANCELS each monitor
+# task when its session ends, and the cancelled `__aexit__' unsubscribes a
+# session that is already gone -- twice in a row the API connection wedged
+# right after such a termination.  The termination monitor alone never
+# cancels anything.
+_ENABLE_VARIABLE_MONITORS = False
+
+
+# Master switch.  OFF: with ONLY the termination monitor subscribed, the
+# API connection wedged the moment a pane closed (events=0 -- the
+# notification never even reached `async_get').  Kept behind a flag until
+# the control experiment (no monitors at all) says whether iTerm 3.7's
+# termination handling or our subscription is at fault.
+_ENABLE_BRIDGE_MONITORS = False
+
+
+async def _start_bridge_monitors(connection):
+    if not _ENABLE_BRIDGE_MONITORS:
+        _monitor_state["started"] = False
+        return
+    app = await iterm2.async_get_app(connection)
+    _monitor_state["started"] = True
+    asyncio.create_task(_monitor_session_termination(connection))
+    for name in (("jobName", "hostname") if _ENABLE_VARIABLE_MONITORS else ()):
+        async def _spawn(session_id, _name=name):
+            await _monitor_session_variable(connection, session_id, _name)
+        asyncio.create_task(
+            iterm2.EachSessionOnceMonitor.async_foreach_session_create_task(
+                app, _spawn))
+
+
 async def main(connection):
     """Main function to set up and run the web server"""
     app = aiohttp.web.Application()
@@ -3268,6 +3463,11 @@ async def main(connection):
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, 'localhost', 17647)
     await site.start()
+    try:
+        await _start_bridge_monitors(connection)
+        print("Bridge push monitors: session-ended, jobName(claude), hostname")
+    except Exception as e:
+        print(f"Bridge push monitors NOT started: {e}")
     print("Enhanced iTerm2 Web Server running on http://localhost:17647")
     print("Available endpoints:")
     print("  GET  /breakpoint - Get all pane information")
