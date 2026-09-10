@@ -1,0 +1,6 @@
+# Built by iTerm2 from setup.cfg + python-runtime.json — never commit (78 MB)
+**/.venv/
+**/__pycache__/
+.DS_Store
+# Claude Code audit trail from the cc-changes-log hook
+**/.claude/changes.jsonl
