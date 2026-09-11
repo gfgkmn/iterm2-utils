@@ -1253,6 +1253,40 @@ async def select_pane(connection, pane_number):
         return False
 
 
+async def _create_tab_resilient(app, window, profile=None, tries=15, delay=0.1):
+    """`Window.async_create_tab' under iTerm2 3.7 can return None: iTerm
+    answers the RPC with OK, but the library then looks the new session up in
+    the app's CACHED tree, which may not have absorbed the layout change yet.
+    The tab exists; only the lookup raced.  Snapshot the window's tabs first
+    and, on None, refresh until the new tab shows up (<= tries*delay s)."""
+    before = {t.tab_id for t in window.tabs}
+    tab = await window.async_create_tab(profile=profile)
+    for _ in range(tries):
+        if tab is not None and tab.current_session is not None:
+            return tab
+        await asyncio.sleep(delay)
+        await app.async_refresh()
+        w = app.get_window_by_id(window.window_id) or window
+        new = [t for t in w.tabs if t.tab_id not in before]
+        tab = new[-1] if new else None
+    return tab
+
+
+async def _create_window_resilient(app, connection, profile=None, tries=15, delay=0.1):
+    """Same race as `_create_tab_resilient', for `Window.async_create'."""
+    before = {w.window_id for w in app.windows}
+    window = await iterm2.Window.async_create(connection, profile=profile)
+    for _ in range(tries):
+        if (window is not None and window.current_tab is not None
+                and window.current_tab.current_session is not None):
+            return window
+        await asyncio.sleep(delay)
+        await app.async_refresh()
+        new = [w for w in app.windows if w.window_id not in before]
+        window = new[-1] if new else None
+    return window
+
+
 async def create_new_pane(connection):
     """Create a new pane in the current tab.
     Returns a dict with the new session's `iterm_session_id` on success,
@@ -1386,14 +1420,23 @@ async def handle_control(request, connection):
             if window_id:
                 window = app.get_window_by_id(window_id)
                 if window:
-                    tab = await window.async_create_tab(profile=profile_name)
+                    tab = await _create_tab_resilient(app, window, profile_name)
+                    if tab is None:
+                        return aiohttp.web.json_response(
+                            {"error": "create_tab: iTerm said OK but the tab "
+                                      "never appeared in the app tree"},
+                            status=500)
                     session = tab.current_session
                     return aiohttp.web.json_response({
                         "session_id": session.session_id,
                         "tab_id": tab.tab_id,
                     })
             # Fallback: create new window with this profile
-            window = await iterm2.Window.async_create(connection, profile=profile_name)
+            window = await _create_window_resilient(app, connection, profile_name)
+            if window is None:
+                return aiohttp.web.json_response(
+                    {"error": "create_tab: iTerm said OK but the window never "
+                              "appeared in the app tree"}, status=500)
             tab = window.current_tab
             session = tab.current_session
             return aiohttp.web.json_response({
@@ -2133,7 +2176,11 @@ async def handle_control(request, connection):
                 return aiohttp.web.json_response(
                     {"error": "no iTerm window to spawn into"},
                     status=500)
-            new_tab = await target_window.async_create_tab()
+            new_tab = await _create_tab_resilient(app, target_window)
+            if new_tab is None:
+                return aiohttp.web.json_response(
+                    {"error": "create_tab raced the app tree; try again"},
+                    status=500)
             new_session = new_tab.current_session
             # Short delay so the shell prompt initializes before the
             # attach command lands (matches `jump_to_runner_for_iid'
@@ -3098,7 +3145,11 @@ async def handle_control(request, connection):
             if not target_window:
                 return aiohttp.web.json_response(
                     {"error": "no iTerm window to spawn into"}, status=500)
-            new_tab = await target_window.async_create_tab()
+            new_tab = await _create_tab_resilient(app, target_window)
+            if new_tab is None:
+                return aiohttp.web.json_response(
+                    {"error": "create_tab raced the app tree; try again"},
+                    status=500)
             new_session = new_tab.current_session
             # Short delay to let the shell prompt initialize before the
             # attach command lands.
@@ -3215,7 +3266,11 @@ async def handle_control(request, connection):
                             return aiohttp.web.json_response(
                                 {"error": "no iTerm window to "
                                           "spawn into"}, status=500)
-                        new_tab = await target_window.async_create_tab()
+                        new_tab = await _create_tab_resilient(app, target_window)
+                        if new_tab is None:
+                            return aiohttp.web.json_response(
+                                {"error": "create_tab raced the app tree; "
+                                          "try again"}, status=500)
                         new_session = new_tab.current_session
                         await asyncio.sleep(0.3)
                         await new_session.async_send_text(
