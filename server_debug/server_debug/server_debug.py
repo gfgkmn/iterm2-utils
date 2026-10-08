@@ -5,6 +5,7 @@ import json
 import os
 import time
 import re
+import signal
 import subprocess
 from functools import partial
 from pathlib import Path
@@ -13,6 +14,63 @@ import aiohttp.web
 import iterm2
 import paramiko
 import pyperclip
+
+
+def _terminate_stale_instances(marker, timeout=3.0):
+    """Kill older copies of this script before this one starts.
+
+    iTerm2 does not stop autolaunch scripts when it quits: they are
+    reparented to launchd and keep running, so every launch leaves
+    another copy behind.  Here the old copy also still holds
+    port 17647, which would make this one fail to bind.  Newest instance wins; our own process
+    and our it2_api_wrapper parent are never touched.
+    """
+    me, parent = os.getpid(), os.getppid()
+    try:
+        out = subprocess.run(['/bin/ps', '-ax', '-o', 'pid=,command='],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return []
+    victims = []
+    for line in out.splitlines():
+        pid_str, _, cmd = line.strip().partition(' ')
+        tokens = cmd.split()
+        # Match only a real invocation: an interpreter (or iTerm's wrapper)
+        # whose ARGUMENT is this script.  Matching the bare string would also
+        # hit any shell, editor or grep that merely mentions the filename.
+        if not tokens or os.path.basename(tokens[0]) not in (
+                'python', 'python3', 'bash', 'sh'):
+            continue
+        if not any(tok.endswith(marker) for tok in tokens[1:]):
+            continue
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid not in (me, parent):
+            victims.append(pid)
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + timeout
+    for pid in victims:
+        while time.time() < deadline:          # wait for it to actually exit
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(0.1)
+        else:                                   # still alive at the deadline
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    if victims:
+        print("Terminated stale instance(s): %s" % victims)
+    return victims
+
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3490,6 +3548,7 @@ async def _start_bridge_monitors(connection):
 
 async def main(connection):
     """Main function to set up and run the web server"""
+    _terminate_stale_instances('server_debug/server_debug.py')
     app = aiohttp.web.Application()
 
     # Create handlers with connection binding
