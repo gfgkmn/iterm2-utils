@@ -1414,6 +1414,49 @@ async def handle_send_code(request, connection):
                                     status=400)
 
 
+def scan_review_screen(text_lines):
+    """Parse the last step of a multi-question AskUserQuestion form.
+
+    CC ends such a form with a review screen: `Review your answers',
+    each question with `→ answer', then `1. Submit answers / 2. Cancel'.
+    It carries no `Enter to select ... Esc to cancel' footer, so the
+    question scan misses it and the screen came back `unstructured':
+    Emacs then showed no banner and the form could only be submitted in
+    the terminal.  Returns a `numbered' question response, or None.
+    """
+    opt_re = re.compile(r'^\s*([❯>])?\s*(\d+)\.\s*([^\d\s].*?)\s*$')
+    lo = max(0, len(text_lines) - 40)
+    head = None
+    for i in range(len(text_lines) - 1, lo - 1, -1):
+        if text_lines[i].strip() == "Review your answers":
+            head = i
+            break
+    if head is None:
+        return None
+    options, summary, cursor = [], [], 0
+    for line in text_lines[head + 1:]:
+        m = opt_re.match(line)
+        if m:
+            if m.group(1):
+                cursor = len(options)
+            options.append({"number": int(m.group(2)),
+                            "label": m.group(3).strip(),
+                            "tag": None, "kind": "choice",
+                            "description": None})
+        elif options:
+            if line.strip():
+                break          # text after the options: not this screen
+        elif line.strip():
+            summary.append(line.rstrip())
+    labels = [o["label"] for o in options]
+    if "Submit answers" not in labels:
+        return None
+    return {"type": "numbered", "prompt_kind": "question",
+            "cursor": cursor, "options": labels, "options_rich": options,
+            "question": "Review your answers", "header": None,
+            "context_lines": summary, "questions": []}
+
+
 async def handle_control(request, connection):
     """Handler for control operations like selecting panes or creating new ones"""
     try:
@@ -2842,6 +2885,8 @@ async def handle_control(request, connection):
             result = _scan_permission()
             if result is None:
                 result = _scan_question()
+            if result is None:
+                result = scan_review_screen(text_lines)
             if result is None:
                 _log_unstructured("unstructured")
                 return aiohttp.web.json_response(
