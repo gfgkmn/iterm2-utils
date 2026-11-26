@@ -2373,6 +2373,58 @@ async def handle_control(request, connection):
             panes = [p for p in results if p is not None]
             return aiohttp.web.json_response({"panes": panes})
 
+        elif action == 'read_pane_screen':
+            # The text now on a pane's screen, unparsed.
+            #
+            # `inspect_pane_options' below reads a screen AND parses it
+            # as a Claude Code prompt.  A caller that parses for itself
+            # -- the Emacs bridge does, per agent: Codex and Antigravity
+            # draw their prompts differently -- asks for the lines here.
+            #
+            # Request:  {"iid": "..."} and/or {"tmux_session": "..."};
+            #           tmux is preferred when given, as below.
+            # Response: {"lines": [...], "source": "tmux" | "iterm"}
+            iid = data.get('iid')
+            tmux_session = data.get('tmux_session')
+            if not iid and not tmux_session:
+                return aiohttp.web.json_response(
+                    {"error": "missing iid or tmux_session"}, status=400)
+            text_lines = []
+            source = None
+            if tmux_session and _TMUX_BIN:
+                try:
+                    out = subprocess.check_output(
+                        [_TMUX_BIN, "capture-pane",
+                         "-t", tmux_session, "-p"],
+                        text=True, timeout=2,
+                        stderr=subprocess.DEVNULL)
+                    text_lines = out.splitlines()
+                    source = "tmux"
+                except Exception:
+                    text_lines = []
+            if not text_lines and iid:
+                source = "iterm"
+                app = await iterm2.async_get_app(connection)
+                await _throttled_app_refresh(app)
+                session = app.get_session_by_id(iid)
+                if not session:
+                    return aiohttp.web.json_response(
+                        {"error": f"iid not found: {iid}"}, status=404)
+                line_info = await session.async_get_line_info()
+                lines = await session.async_get_contents(
+                    first_line=line_info.first_visible_line_number,
+                    number_of_lines=line_info.mutable_area_height)
+                for ln in lines:
+                    try:
+                        text_lines.append(ln.string)
+                    except Exception:
+                        text_lines.append("")
+                # NUL is a cell that was touched and never painted; see
+                # the same step in `inspect_pane_options'.
+                text_lines = [ln.replace('\x00', ' ') for ln in text_lines]
+            return aiohttp.web.json_response(
+                {"lines": text_lines, "source": source})
+
         elif action == 'inspect_pane_options':
             # Scrape a pane for CC's numbered-options prompt.
             #
