@@ -2697,10 +2697,36 @@ async def handle_control(request, connection):
                         break
                 if end_idx is None:
                     return None
-                # Find all option lines between somewhere-above and END
-                # (looking up to 50 lines for tall question blocks).
+                # The dialog opens with a rule across the screen and,
+                # under it, its header (`☐ Version', or `← ☐ A ☐ B ✔
+                # Submit →').  TOP is the lowest rule that has such a
+                # header as its next line of text and an option below
+                # it; the rule above `Chat about this' has neither.
+                # Options are looked for below TOP only: looked for
+                # from 50 lines above the footer, a numbered list that
+                # closes the reply above (`1. Commit ...?  2. Fix
+                # ...?') was read as the first options -- five options
+                # numbered 1 2 1 2 3 for a question of three.  Same
+                # rule as `claude-code-bridge--claude-question-top' in
+                # claude-code-bridge-claude.el.
+                top_idx = None
+                for i in range(end_idx - 1, max(0, end_idx - 50) - 1, -1):
+                    if (not text_lines[i].strip()
+                            or not divider_re.match(text_lines[i])):
+                        continue
+                    nxt = next((j for j in range(i + 1, end_idx)
+                                if text_lines[j].strip()), None)
+                    if (nxt is not None
+                            and question_header_re.search(text_lines[nxt])
+                            and any(opt_re.match(text_lines[j])
+                                    for j in range(nxt + 1, end_idx))):
+                        top_idx = i
+                        break
+                # Find all option lines between TOP -- or, with no TOP
+                # on the screen, 50 lines above -- and END.
                 opt_indices = []
-                walk_lo = max(0, end_idx - 50)
+                walk_lo = (top_idx + 1 if top_idx is not None
+                           else max(0, end_idx - 50))
                 for i in range(end_idx - 1, walk_lo - 1, -1):
                     if opt_re.match(text_lines[i]):
                         opt_indices.append(i)
